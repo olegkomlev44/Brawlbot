@@ -64,6 +64,7 @@ class Brain(private val w: Int, private val h: Int) {
     private var cdx = 0.0; private var cdy = 0.0
     private var wx = 0.0; private var wy = 0.0; private var lastT = 0L
     private var lastGhostShot = 0L
+    private var boxSince = 0L; private var boxIgnoreUntil = 0L   // таймаут: не залипать на недостижимом ящике
     private var matchStart = 0L; private var lastPlayerSeen = 0L; private var gadgetCharges = Layout.GADGET_CHARGES
 
     // блоки 8x8 для ядовитых облаков и кубков (цвет у них одинаковый, отличаем по размеру)
@@ -93,6 +94,7 @@ class Brain(private val w: Int, private val h: Int) {
         gadgetCharges = Layout.GADGET_CHARGES; matchStart = now
         wx = 0.0; wy = 0.0; lastSuper = 0L; lastGadget = 0L; evadeUntil = 0L
         hpMark = -1f; healing = false; escapeUntil = 0L; stuckSince = 0L; prevHp = -1f
+        boxSince = 0L; boxIgnoreUntil = 0L
     }
 
     // ================= (2) КАРТА: LOS и A* =================
@@ -416,6 +418,8 @@ class Brain(private val w: Int, private val h: Int) {
                 if (g > 200 && r in 141..189 && b in 111..169) pc[bi]++
                 else if (b > 150 && r in 80..144 && g in 80..144 && abs(r - g) < 16 && b - r > 40) wcnt[bi]++
                 else if (r > 140 && g < 115 && b in 96..149 && r - g > 40) wcnt[bi]++
+                else if (b > 232 && r in 170..250 && g in 165..248 && b - r in 8..75) wcnt[bi]++          // светлые стены с крестом
+                else if (b > 105 && r in 60..99 && g in 60..99 && abs(r - g) < 12 && b - r in 35..70) wcnt[bi]++ // их тёмные грани
                 else if (r < 80 && g in 96..149 && b > 115 && g - r > 40) bcnt[bi]++
                 if (r < 150 && g > 195 && b < 130) { run++; if (run == 12 && nCand < 16) { candX[nCand] = x - 11; candY[nCand] = y; nCand++ } } else run = 0
             }
@@ -462,6 +466,7 @@ class Brain(private val w: Int, private val h: Int) {
                 if (!near) { csx += bx * B + B / 2; csy += by * B + B / 2; cnn++ }
             }
         }
+        for (yy in max(0, meBy - 1)..min(bhc - 1, meBy + 1)) for (xx in max(0, meBx - 1)..min(bwc - 1, meBx + 1)) obst[yy * bwc + xx] = false
         val pl = hypot(pvx, pvy)
         if (pl > 1e-6) { pvux = pvx / pl; pvuy = pvy / pl } else { pvux = 0.0; pvuy = 0.0 }
         val inBush = bushB[meBy * bwc + meBx]
@@ -491,6 +496,9 @@ class Brain(private val w: Int, private val h: Int) {
         for (i in 0 until nc) {
             val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
             if (sn[i] < 40 || wd < w * 0.023 || wd < 2.5 * ht) continue
+            // это МОИ полоски (патроны под хп): раньше принимались за ящик на расстоянии 0
+            val cxb = (x0[i] + x1[i]) / 2.0
+            if (hp >= 0f && abs(cxb - meX) < w * 0.03 && y0[i] > meY - h * 0.085 && y0[i] < meY - h * 0.03) continue
             var pink = 0
             for (yy in max(0, y0[i].toInt() - 23) until y0[i].toInt()) for (xx in max(0, x0[i].toInt() - 3)..min(w - 1, x1[i].toInt() + 3)) {
                 val c = px[yy * stride + xx]; val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
@@ -500,9 +508,14 @@ class Brain(private val w: Int, private val h: Int) {
             val d = hypot(rx, ry)
             if (pink >= 6) {
                 if (nd < N) { eX[nd] = rx; eY[nd] = ry; eH[nd] = (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0); nd++ }
-            } else { nb++; if (d < boxD) { boxD = d; boxX = rx; boxY = ry } }
+            } else {
+                // ящик: тонкая полоска хп, не у самого себя, не в декоре сверху (тыквы/надгробия), полоска не толстая
+                if (d < h * 0.10 || y0[i] < h * 0.19 || ht > max(6.0, h * 0.025)) continue
+                nb++; if (d < boxD) { boxD = d; boxX = rx; boxY = ry }
+            }
         }
 
+        if (now < boxIgnoreUntil) nb = 0
         // ---- (1) треки: подтверждённые враги (>=3 наблюдений) ----
         updateTracks(now, nd)
         vis.clear()
@@ -584,7 +597,9 @@ class Brain(private val w: Int, private val h: Int) {
             }
             "DROP" -> { goalToward(dsx - meX, dsy - meY, now, avoid); pickMove(gdx, gdy, 2.2, 0.5, if (ne > 0) 1.2 else 0.0, 0.0, 0.0) }
             "BOX" -> {
-                if (boxD > h * 0.38) { goalToward(boxX, boxY, now, avoid); pickMove(gdx, gdy, 2.2, 0.5, if (ne > 0) 1.2 else 0.0, 0.0, 0.0) }
+                if (boxSince == 0L) boxSince = now
+                if (now - boxSince > 10000) { boxIgnoreUntil = now + 8000; boxSince = 0L }
+                if (boxD > h * 0.38 || !los(boxX, boxY)) { goalToward(boxX, boxY, now, avoid); pickMove(gdx, gdy, 2.2, 0.5, if (ne > 0) 1.2 else 0.0, 0.0, 0.0) }
                 else moving = false
             }
             "ATTACK" -> {
@@ -610,6 +625,7 @@ class Brain(private val w: Int, private val h: Int) {
                 pickMove(rx / l, ry / l, 1.5, 0.0, 0.0, 0.0, 0.0)
             }
         }
+        if (state != "BOX") boxSince = 0L
         var mx = if (moving) bestMx.toFloat() else 0f
         var my = if (moving) bestMy.toFloat() else 0f
         if (now < escapeUntil) { val t = mx; mx = -my * escDir; my = t * escDir; if (mx == 0f && my == 0f) mx = escDir }
@@ -647,7 +663,7 @@ class Brain(private val w: Int, private val h: Int) {
         } else if (state == "GHOST" && hypot(grx, gry) < h * Layout.SHOOT && now - lastGhostShot > 700 && (ammo < 0f || ammo > 0.5f)) {
             val l = hypot(grx, gry).coerceAtLeast(1.0)
             o.ax = (grx / l).toFloat(); o.ay = (gry / l).toFloat(); o.attack = true; lastGhostShot = now
-        } else if (state == "BOX" && boxD < h * Layout.SHOOT && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
+        } else if (state == "BOX" && boxD < h * Layout.SHOOT && los(boxX, boxY) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
             o.ax = (boxX / boxD).toFloat(); o.ay = (boxY / boxD).toFloat(); o.attack = true // фарм ящиков ради кубков
         }
         return o
