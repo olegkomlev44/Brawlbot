@@ -16,7 +16,14 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class CaptureService : Service() {
-    companion object { @Volatile var record = false }
+    companion object {
+        @Volatile var record = false
+        @Volatile var running = false
+        @Volatile var mode = Mode.SHOWDOWN
+        // статус для экрана приложения
+        @Volatile var st = "ROAM"; @Volatile var sHp = -1f; @Volatile var sAmmo = -1f; @Volatile var sEn = 0
+        @Volatile var frames = 0L; @Volatile var framesSaved = 0; @Volatile var recDir = ""
+    }
     private var proj: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -47,7 +54,8 @@ class CaptureService : Service() {
 
         ht = HandlerThread("cv").also { it.start() }
         io = Executors.newSingleThreadExecutor()
-        val dir = File(getExternalFilesDir(null), "rec_" + System.currentTimeMillis()).apply { mkdirs() }
+        val dir = File(getExternalFilesDir(null), "rec_" + System.currentTimeMillis())
+        recDir = dir.absolutePath; framesSaved = 0; frames = 0; running = true
         val log = File(dir, "log.jsonl")
         val brain = Brain(cw, ch)
         var bmp: Bitmap? = null; var px = IntArray(0)
@@ -64,14 +72,17 @@ class CaptureService : Service() {
                     if (bmp == null || bmp!!.width != bw) { bmp = Bitmap.createBitmap(bw, ch, Bitmap.Config.ARGB_8888); px = IntArray(bw * ch) }
                     bmp!!.copyPixelsFromBuffer(p.buffer); img.close()
                     bmp!!.getPixels(px, 0, bw, 0, 0, bw, ch)
+                    brain.mode = mode
                     val a = brain.decide(px, bw, now)
+                    st = a.state; sHp = a.hp; sAmmo = a.ammo; sEn = a.enemies; frames++
                     BotService.inst?.act(a, sw, sh)
                     if (record && tick % 4 == 0) {
                         val copy = bmp!!.copy(Bitmap.Config.ARGB_8888, false); val name = "f$tick.jpg"
                         val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo}}""" + "\n"
                         io?.execute { // запись на диск в отдельном потоке
+                            dir.mkdirs()
                             FileOutputStream(File(dir, name)).use { copy.compress(Bitmap.CompressFormat.JPEG, 70, it) }
-                            log.appendText(line); copy.recycle()
+                            log.appendText(line); copy.recycle(); framesSaved++
                         }
                     }
                     tick++
@@ -82,6 +93,7 @@ class CaptureService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         reader?.setOnImageAvailableListener(null, null)
         ht?.quitSafely(); io?.shutdown(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
     }
