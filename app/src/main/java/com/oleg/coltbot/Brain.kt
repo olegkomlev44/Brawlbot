@@ -12,7 +12,7 @@ object Layout {
     const val TOO_CLOSE = 0.32f; const val TOO_FAR = 0.55f; const val SHOOT = 0.70f
     const val PLAYER_SPEED = 0.25f; const val BULLET_SPEED = 1.2f
     const val BAR_FULL = 0.0457f     // ширина полной полоски хп в долях ширины кадра
-    const val LATENCY = 0.12f
+    const val LATENCY = 0.09f
     const val SLOT_DMG = 0.30f
     // --- новое ---
     const val FIRE_MIN_AMMO = 0.32f  // выстрел возможен от одного полного слота (1/3 шкалы)
@@ -24,7 +24,7 @@ enum class Mode { SHOWDOWN, TEAM }
 
 class Action {
     var mx = 0f; var my = 0f; var ax = 0f; var ay = 0f
-    var attack = false; var sup = false; var gadget = false
+    var attack = false; var attackTap = false; var sup = false; var gadget = false
     var enemies = 0; var state = "ROAM"; var hp = -1f; var ammo = -1f; var eHp = -1f
 }
 
@@ -312,7 +312,7 @@ class Brain(private val w: Int, private val h: Int) {
         }
         tt = tt.coerceIn(0.0, 1.0)
         // доверие к упреждению: мало наблюдений / враг мечется -> стреляем ближе к текущей позиции
-        val conf = if (t.hits >= 4) 0.35 + 0.65 * t.cons else 0.3
+        val conf = if (t.hits >= 4) 0.45 + 0.55 * t.cons else 0.35
         var lx = t.vx * tt * conf; var ly = t.vy * tt * conf
         val ll = hypot(lx, ly); val cap = h * 0.35
         if (ll > cap) { lx *= cap / ll; ly *= cap / ll }
@@ -388,7 +388,8 @@ class Brain(private val w: Int, private val h: Int) {
                         t.cons = 0.8 * t.cons + 0.2 * ((cs + 1) / 2).coerceIn(0.0, 1.0)
                     } else if (pm <= still && cm <= still) t.cons = 0.8 * t.cons + 0.2
                     else t.cons = 0.8 * t.cons + 0.06
-                    t.vx += 0.45 * (mvx - t.vx); t.vy += 0.45 * (mvy - t.vy)
+                    // быстрое сглаживание: при 10-11 к/с alpha 0.45 даёт ~0.25 c лага в оценке скорости
+                    t.vx += 0.70 * (mvx - t.vx); t.vy += 0.70 * (mvy - t.vy)
                 }
                 t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = eH[i]
                 t.hits++; t.last = now; t.stamp = now
@@ -611,7 +612,12 @@ class Brain(private val w: Int, private val h: Int) {
                 // стена между нами - идём обходом; иначе дистанцию держит сама оценка направлений
                 if (tgt != null && engage && !reload && dist > band + 0.08) goalToward(tgt.rx, tgt.ry, now, ne > 1)
                 val wg = if (gdx != 0.0 || gdy != 0.0) 1.6 else 0.0
-                pickMove(gdx, gdy, wg, band, 3.0, 1.0, if (reload || !engage) 1.8 else 0.2)
+                // если дистанция в порядке, враг виден и есть патроны - стоим и стреляем,
+                // стрейф только короткими перебежками (иначе бот "наворачивает круги" и сам себе мажет прицел)
+                val hold = tgt != null && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
+                        los(tgt.rx, tgt.ry) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
+                pickMove(gdx, gdy, wg, band, 3.0, if (hold) 0.15 else 0.6, if (reload || !engage) 1.8 else 0.2)
+                if (hold && Random.nextFloat() < 0.65f) moving = false
             }
             "GHOST" -> {
                 val gd = hypot(grx, gry).coerceAtLeast(1.0)
@@ -619,7 +625,7 @@ class Brain(private val w: Int, private val h: Int) {
                 else pickMove(-gry / gd * strafe, grx / gd * strafe, 1.5, 0.0, 0.0, 0.0, 0.0)
             }
             else -> {
-                if (now - lastWander > 2500) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
+                if (now - lastWander > 4500) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
                 val rx = cos(wAng) + 0.6 * cdx; val ry = sin(wAng) + 0.6 * cdy
                 val l = hypot(rx, ry).coerceAtLeast(1e-6)
                 pickMove(rx / l, ry / l, 1.5, 0.0, 0.0, 0.0, 0.0)
@@ -642,6 +648,8 @@ class Brain(private val w: Int, private val h: Int) {
             if (ok && dist > Layout.TOO_FAR && ammo in 0f..0.66f && !killable) ok = false
             if (state != "PINCH") {
                 o.attack = ok
+                // в упор свайп-прицел ненадёжен: игра сама наведётся точнее по тапу
+                if (ok && sight && dist < 0.33f) o.attackTap = true
                 // супер: сколько врагов лежит на линии выстрела
                 var value = 0
                 for (u in vis) {
@@ -651,20 +659,27 @@ class Brain(private val w: Int, private val h: Int) {
                     if (d < Layout.SHOOT * h * 1.1 && along > 0 && cross < h * 0.06) value++
                 }
                 val behindWall = !sight && dist < 0.55f
-                if (now - lastSuper > 3500 &&
-                    (value >= 2 || (value >= 1 && (tgt.hp <= 0.45 || behindWall || (sight && dist < 0.5f && ne == 1))))) {
+                // жмём ульту щедро: двое на линии, добивание, пробитие стены, дуэль на средней дистанции
+                // или почти смертельная опасность (ульт Кольта ломает стены и отпугивает)
+                if (now - lastSuper > 2500 &&
+                    (value >= 2 || (value >= 1 && (tgt.hp <= 0.60 || behindWall || (sight && dist < 0.6f && ne == 1))) ||
+                     (low && sight && dist < 0.45f))) {
                     o.sup = true; lastSuper = now
                 }
-                // гаджет: перезарядка в бою, когда патронов почти нет
-                if (gadgetCharges > 0 && ammo in 0f..0.34f && dist < 0.55f && (sight || dist < 0.35f) && now - lastGadget > 2500) {
-                    o.gadget = true; lastGadget = now; gadgetCharges--
-                }
+                // гаджет (speedloader): патроны кончаются в бою ИЛИ мало хп и надо дожать/отбиться
+                val wantGadget = gadgetCharges > 0 && dist < 0.65f && now - lastGadget > 2000 &&
+                        ((ammo in 0f..0.40f && (sight || dist < 0.45f)) || (low && ammo in 0f..0.67f))
+                if (wantGadget) { o.gadget = true; lastGadget = now; gadgetCharges-- }
             }
         } else if (state == "GHOST" && hypot(grx, gry) < h * Layout.SHOOT && now - lastGhostShot > 700 && (ammo < 0f || ammo > 0.5f)) {
             val l = hypot(grx, gry).coerceAtLeast(1.0)
             o.ax = (grx / l).toFloat(); o.ay = (gry / l).toFloat(); o.attack = true; lastGhostShot = now
-        } else if (state == "BOX" && boxD < h * Layout.SHOOT && los(boxX, boxY) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
-            o.ax = (boxX / boxD).toFloat(); o.ay = (boxY / boxD).toFloat(); o.attack = true // фарм ящиков ради кубков
+        } else if (state == "BOX" && boxD < h * Layout.SHOOT && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
+            o.ax = (boxX / boxD).toFloat(); o.ay = (boxY / boxD).toFloat()
+            if (los(boxX, boxY)) o.attack = true
+            // ящик близко - тап, авто-наведение игры попадает надёжнее нашего свайпа;
+            // и даже если los() ошибся из-за ложной "стены", тап в упор всё равно достанет
+            if (boxD < h * 0.42f) { o.attack = true; o.attackTap = true }
         }
         return o
     }

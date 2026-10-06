@@ -36,8 +36,14 @@ class BotService : AccessibilityService() {
         }
         if (a.attack) {
             val p = Path(); val cx = w * Layout.ATK_X; val cy = h * Layout.ATK_Y
-            p.moveTo(cx, cy); p.lineTo(cx + a.ax * r, cy + a.ay * r)
-            g.addStroke(GestureDescription.StrokeDescription(p, 0, 100)); n++
+            p.moveTo(cx, cy)
+            if (a.attackTap) {
+                // тап = встроенное авто-наведение игры (точно бьёт в упор и по ящикам)
+                g.addStroke(GestureDescription.StrokeDescription(p, 0, 50)); n++
+            } else {
+                p.lineTo(cx + a.ax * r, cy + a.ay * r)
+                g.addStroke(GestureDescription.StrokeDescription(p, 0, 100)); n++
+            }
         }
         if (a.sup) { // супер свайпом с упреждением, как обычная атака
             val p = Path(); val cx = w * Layout.SUP_X; val cy = h * Layout.SUP_Y

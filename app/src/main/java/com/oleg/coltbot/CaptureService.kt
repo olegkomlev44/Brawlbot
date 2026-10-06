@@ -9,7 +9,10 @@ import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
+import android.content.ContentValues
+import android.net.Uri
 import android.os.*
+import android.provider.MediaStore
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
@@ -29,6 +32,70 @@ class CaptureService : Service() {
     private var reader: ImageReader? = null
     private var ht: HandlerThread? = null
     private var io: ExecutorService? = null
+
+    // --- запись: Downloads/Brawlbot/rec_<ts>/ (через MediaStore, видно в любом файловом менеджере) ---
+    private var recBase = ""                 // RELATIVE_PATH, например "Download/Brawlbot/rec_123/"
+    private var legacyDir: File? = null      // запасной вариант для Android < 10
+    private var logUri: Uri? = null
+    private val logBuf = StringBuilder()
+    private val logLock = Any()
+
+    private fun openRecDir(ts: Long) {
+        val name = "rec_$ts"
+        if (Build.VERSION.SDK_INT >= 29) {
+            recBase = Environment.DIRECTORY_DOWNLOADS + "/Brawlbot/" + name + "/"
+            recDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Brawlbot/$name").absolutePath
+            val cv = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, "log.jsonl")
+                put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                put(MediaStore.Downloads.RELATIVE_PATH, recBase)
+            }
+            logUri = contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), cv)
+        } else {
+            @Suppress("DEPRECATION")
+            val d = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Brawlbot/$name")
+            d.mkdirs()
+            if (d.canWrite()) { legacyDir = d; recDir = d.absolutePath }
+            else { legacyDir = File(getExternalFilesDir(null), name); recDir = legacyDir!!.absolutePath }
+        }
+    }
+
+    private fun saveFrame(name: String, bmp: Bitmap) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val cv = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Downloads.RELATIVE_PATH, recBase)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), cv) ?: return
+            try { contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 70, it) } }
+            catch (e: Exception) { contentResolver.delete(uri, null, null) }
+        } else {
+            val d = legacyDir ?: return
+            FileOutputStream(File(d, name)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 70, it) }
+        }
+    }
+
+    private fun appendLog(line: String) {
+        synchronized(logLock) { logBuf.append(line) }
+    }
+
+    private fun flushLog() {
+        val chunk: String
+        synchronized(logLock) {
+            if (logBuf.isEmpty()) return
+            chunk = logBuf.toString(); logBuf.setLength(0)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val u = logUri ?: return
+                contentResolver.openOutputStream(u, "wa")?.use { it.write(chunk.toByteArray()) }
+            } else {
+                val d = legacyDir ?: return
+                FileOutputStream(File(d, "log.jsonl"), true).use { it.write(chunk.toByteArray()) }
+            }
+        } catch (_: Exception) {}
+    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -54,9 +121,8 @@ class CaptureService : Service() {
 
         ht = HandlerThread("cv").also { it.start() }
         io = Executors.newSingleThreadExecutor()
-        val dir = File(getExternalFilesDir(null), "rec_" + System.currentTimeMillis())
-        recDir = dir.absolutePath; framesSaved = 0; frames = 0; running = true
-        val log = File(dir, "log.jsonl")
+        framesSaved = 0; frames = 0; running = true
+        if (record) openRecDir(System.currentTimeMillis()) else recDir = ""
         val brain = Brain(cw, ch)
         var bmp: Bitmap? = null; var px = IntArray(0)
         var last = 0L; var tick = 0
@@ -78,11 +144,11 @@ class CaptureService : Service() {
                     BotService.inst?.act(a, sw, sh)
                     if (record && tick % 4 == 0) {
                         val copy = bmp!!.copy(Bitmap.Config.ARGB_8888, false); val name = "f$tick.jpg"
-                        val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo}}""" + "\n"
+                        val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo}}""" + "\n"
                         io?.execute { // запись на диск в отдельном потоке
-                            dir.mkdirs()
-                            FileOutputStream(File(dir, name)).use { copy.compress(Bitmap.CompressFormat.JPEG, 70, it) }
-                            log.appendText(line); copy.recycle(); framesSaved++
+                            saveFrame(name, copy); copy.recycle(); framesSaved++
+                            appendLog(line)
+                            if (framesSaved % 32 == 0) flushLog()
                         }
                     }
                     tick++
@@ -95,6 +161,10 @@ class CaptureService : Service() {
     override fun onDestroy() {
         running = false
         reader?.setOnImageAvailableListener(null, null)
-        ht?.quitSafely(); io?.shutdown(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
+        // дописываем остаток лога синхронно, пока сервис не умер
+        try { io?.execute { flushLog() } } catch (_: Exception) {}
+        try { io?.shutdown(); io?.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
+        flushLog()
+        ht?.quitSafely(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
     }
 }
