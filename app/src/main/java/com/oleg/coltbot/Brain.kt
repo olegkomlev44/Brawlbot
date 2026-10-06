@@ -108,7 +108,7 @@ class Brain(private val w: Int, private val h: Int) {
     private fun addRed(x: Int, y: Int) {
         for (i in 0 until nc) {
             if (abs(sx[i] / sn[i] - x) < w * 0.04 && abs(sy[i] / sn[i] - y) < h * 0.02) {
-                sx[i] += x; sy[i] += y; sn[i] += 1.0
+                sx[i] += x.toDouble(); sy[i] += y.toDouble(); sn[i] += 1.0
                 x0[i] = min(x0[i], x.toDouble()); x1[i] = max(x1[i], x.toDouble()); y0[i] = min(y0[i], y.toDouble()); y1[i] = max(y1[i], y.toDouble()); return
             }
         }
@@ -140,7 +140,7 @@ class Brain(private val w: Int, private val h: Int) {
         }
         // зелёные кубики из дропа: плотные квадратные блоки (тонкие полоски хп не проходят порог)
         var dsx = 0.0; var dsy = 0.0; var dn = 0
-        for (i in bc.indices) if (bc[i] >= 14) { dsx += (i % bw12) * 12 + 6; dsy += (i / bw12) * 12 + 6; dn++ }
+        for (i in bc.indices) if (bc[i] >= 14) { dsx += ((i % bw12) * 12 + 6).toDouble(); dsy += ((i / bw12) * 12 + 6).toDouble(); dn++ }
         // свои хп/патроны
         var gMin = w; var gMax = -1; var oMin = w; var oMax = -1
         for (yy in (h * 0.38).toInt() until (h * 0.64).toInt() step 2) for (xx in (w * 0.43).toInt() until (w * 0.57).toInt() step 2) {
