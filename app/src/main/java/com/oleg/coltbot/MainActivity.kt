@@ -36,7 +36,7 @@ class MainActivity : Activity() {
     private lateinit var tvState: TextView; private lateinit var tvHp: TextView; private lateinit var tvAmmo: TextView
     private lateinit var tvEn: TextView; private lateinit var tvFps: TextView
     private lateinit var barHp: ProgressBar; private lateinit var barAmmo: ProgressBar
-    private lateinit var tvFrames: TextView; private lateinit var tvPath: TextView
+    private lateinit var tvFrames: TextView; private lateinit var tvPath: TextView; private lateinit var tvDiag: TextView
     private var prevT = 0L; private var prevF = 0L; private var fps = 0
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -107,6 +107,11 @@ class MainActivity : Activity() {
         left.addView(button("Открыть спецвозможности", cBlue) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
         btnStart = button("▶  Старт", cGreen) { onStartStop() }
         left.addView(btnStart)
+        left.addView(button("Проверить управление (джойстик)", cBlue) {
+            val b = BotService.inst
+            if (b == null) Toast.makeText(this, "Служба спецвозможностей не подключена: выключи и включи Colt Bot заново", Toast.LENGTH_LONG).show()
+            else { Toast.makeText(this, "Открой игру: персонаж пойдёт вправо-влево ~2 сек", Toast.LENGTH_LONG).show(); b.selfTest() }
+        })
 
         // ----- правая колонка: живые данные, запись, режим -----
         val right = column()
@@ -117,6 +122,7 @@ class MainActivity : Activity() {
         tvEn = label("Врагов в поле зрения: —"); tvFps = label("Кадров/с: —", 13f, cMuted)
         live.addView(tvState); live.addView(tvHp); live.addView(barHp); live.addView(tvAmmo); live.addView(barAmmo)
         live.addView(tvEn); live.addView(tvFps)
+        tvDiag = label("", 11f, cMuted); live.addView(tvDiag)
         right.addView(live)
 
         val set = card("НАСТРОЙКИ")
@@ -136,18 +142,19 @@ class MainActivity : Activity() {
             addView(left); addView(right)
         }
         setContentView(ScrollView(this).apply { setBackgroundColor(cBg); isFillViewport = true; addView(root) })
-        requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
+        requestPermissions(if (android.os.Build.VERSION.SDK_INT < 29) arrayOf("android.permission.POST_NOTIFICATIONS", "android.permission.WRITE_EXTERNAL_STORAGE") else arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
     }
 
-    private fun accOn(): Boolean {
-        if (BotService.inst != null) return true
+    // служба реально подключена только если жив BotService.inst (строка в настройках может остаться после переустановки)
+    private fun accOn(): Boolean = BotService.inst != null
+    private fun accListed(): Boolean {
         val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
         return s.contains(packageName)
     }
 
     private fun onStartStop() {
         if (CaptureService.running) { stopService(Intent(this, CaptureService::class.java)); return }
-        if (!accOn()) { Toast.makeText(this, "Сначала включи Colt Bot в спецвозможностях", Toast.LENGTH_LONG).show(); return }
+        if (!accOn()) { Toast.makeText(this, if (accListed()) "Служба в списке, но не запущена: выключи и включи Colt Bot в спецвозможностях" else "Сначала включи Colt Bot в спецвозможностях", Toast.LENGTH_LONG).show(); return }
         startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), 1)
     }
 
@@ -157,11 +164,11 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         val acc = accOn(); val run = CaptureService.running
-        rAcc.set(acc, if (acc) "включены" else "выключены"); rCap.set(run, if (run) "работает" else "остановлен")
+        rAcc.set(acc, if (acc) "подключены" else if (accListed()) "включены, но служба не запущена" else "выключены"); rCap.set(run, if (run) "работает" else "остановлен")
         btnStart.text = if (run) "■  Стоп" else "▶  Старт"
         (btnStart.background as GradientDrawable).setColor(if (run) cRed else cGreen)
         hint.text = when {
-            !acc -> "1. Включи Colt Bot в спецвозможностях"
+            !acc -> (if (accListed()) "1. Выключи и снова включи Colt Bot в спецвозможностях (после обновления приложения служба отваливается)" else "1. Включи Colt Bot в спецвозможностях")
             !run -> "2. Нажми «Старт» и разреши запись экрана"
             else -> "3. Открой игру и зайди в бой"
         }
@@ -179,8 +186,11 @@ class MainActivity : Activity() {
             tvState.text = "Бот остановлен"; tvHp.text = "Здоровье"; tvAmmo.text = "Патроны"
             barHp.progress = 0; barAmmo.progress = 0; tvEn.text = "Врагов в поле зрения: —"; tvFps.text = "Кадров/с: —"
         }
+        tvDiag.text = "Решение: ${CaptureService.lastAct}\nЖесты: отправлено ${BotService.sent}, выполнено ${BotService.done}, отменено ${BotService.cancelled}, отклонено ${BotService.rejected}" +
+            (if (BotService.lastErr.isNotEmpty()) "\nОшибка жеста: ${BotService.lastErr}" else "") +
+            (if (CaptureService.recErr.isNotEmpty()) "\nОшибка: ${CaptureService.recErr}" else "")
         tvFrames.text = "Сохранено кадров: ${CaptureService.framesSaved}"
-        tvPath.text = "Папка: " + (CaptureService.recDir.ifEmpty { getExternalFilesDir(null)?.absolutePath ?: "" })
+        tvPath.text = "Папка: " + (CaptureService.recDir.ifEmpty { "Загрузки/Brawlbot/ (появится при записи)" })
     }
 
     @Deprecated("old api")

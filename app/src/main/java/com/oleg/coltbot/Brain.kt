@@ -12,7 +12,7 @@ object Layout {
     const val TOO_CLOSE = 0.32f; const val TOO_FAR = 0.55f; const val SHOOT = 0.70f
     const val PLAYER_SPEED = 0.25f; const val BULLET_SPEED = 1.2f
     const val BAR_FULL = 0.0457f     // ширина полной полоски хп в долях ширины кадра
-    const val LATENCY = 0.09f
+    const val LATENCY = 0.20f      // кадр + расчёт + свайп + доставка жеста (выстрел происходит при ОТПУСКАНИИ пальца)
     const val SLOT_DMG = 0.30f
     // --- новое ---
     const val FIRE_MIN_AMMO = 0.32f  // выстрел возможен от одного полного слота (1/3 шкалы)
@@ -64,13 +64,14 @@ class Brain(private val w: Int, private val h: Int) {
     private var cdx = 0.0; private var cdy = 0.0
     private var wx = 0.0; private var wy = 0.0; private var lastT = 0L
     private var lastGhostShot = 0L
+    private var pBarX = 0.0; private var pBarY = 0.0
     private var boxSince = 0L; private var boxIgnoreUntil = 0L   // таймаут: не залипать на недостижимом ящике
     private var matchStart = 0L; private var lastPlayerSeen = 0L; private var gadgetCharges = Layout.GADGET_CHARGES
 
     // блоки 8x8 для ядовитых облаков и кубков (цвет у них одинаковый, отличаем по размеру)
     private val B = 8; private val bwc = w / 8 + 1; private val bhc = h / 8 + 1
     private val pc = IntArray(bwc * bhc); private val isFull = BooleanArray(bwc * bhc)
-    private val candX = IntArray(16); private val candY = IntArray(16)
+    private val candX = IntArray(64); private val candY = IntArray(64)
     // карта поля прямо с экрана: стены/ящики и кусты по блокам 8x8
     private val obst = BooleanArray(bwc * bhc); private val bushB = BooleanArray(bwc * bhc)
     private val wcnt = IntArray(bwc * bhc); private val bcnt = IntArray(bwc * bhc)
@@ -339,9 +340,23 @@ class Brain(private val w: Int, private val h: Int) {
         var cols = 0
         for (x in max(0, xs - 2)..min(w - 1, xs + 40)) {
             var hit = false
-            for (yy in y + 1..min(h - 1, y + 14)) {
+            for (yy in y + 3..min(h - 1, y + 11)) {
                 val c = px[yy * stride + x]; val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
                 if (r > 190 && g in 90..150 && b < 90) { hit = true; break }
+            }
+            if (hit) cols++
+        }
+        return cols
+    }
+
+    // колонки, где под полоской хп есть шкала патронов: оранжевая (заряд) или тёмно-синяя (пустой слот)
+    private fun barCols(px: IntArray, stride: Int, xs: Int, y: Int): Int {
+        var cols = 0
+        for (x in max(0, xs - 2)..min(w - 1, xs + 40)) {
+            var hit = false
+            for (yy in y + 3..min(h - 1, y + 10)) {
+                val c = px[yy * stride + x]; val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
+                if ((r > 190 && g in 90..150 && b < 90) || (r < 80 && g < 85 && b in 55..120 && b - r >= 15)) { hit = true; break }
             }
             if (hit) cols++
         }
@@ -414,7 +429,7 @@ class Brain(private val w: Int, private val h: Int) {
                 if ((x < uiLx && y > uiLy) || (x > uiRx && y > uiRy)) { run = 0; continue }
                 val c = px[y * stride + x]
                 val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
-                if (r > 190 && g < 100 && b < 105 && r - g > 90) addRed(x, y)
+                if (r > 190 && g < 90 && b < 95 && r - g > 105) addRed(x, y)   // только сама полоска хп, не красное кольцо под целью
                 val bi = (y / B) * bwc + x / B
                 if (g > 200 && r in 141..189 && b in 111..169) pc[bi]++
                 else if (b > 150 && r in 80..144 && g in 80..144 && abs(r - g) < 16 && b - r > 40) wcnt[bi]++
@@ -422,22 +437,33 @@ class Brain(private val w: Int, private val h: Int) {
                 else if (b > 232 && r in 170..250 && g in 165..248 && b - r in 8..75) wcnt[bi]++          // светлые стены с крестом
                 else if (b > 105 && r in 60..99 && g in 60..99 && abs(r - g) < 12 && b - r in 35..70) wcnt[bi]++ // их тёмные грани
                 else if (r < 80 && g in 96..149 && b > 115 && g - r > 40) bcnt[bi]++
-                if (r < 150 && g > 195 && b < 130) { run++; if (run == 12 && nCand < 16) { candX[nCand] = x - 11; candY[nCand] = y; nCand++ } } else run = 0
+                if (r < 150 && g > 195 && b < 130) { run++; if (run == 12 && nCand < 64 && y >= 3 && y + 6 < h) {
+                    // настоящая полоска хп тонкая: выше и ниже посередине зелёного нет (отсеивает зелёные зоны и площадки)
+                    val xm = x + 1
+                    if (!isOwnGreen(px[(y - 3) * stride + xm]) && !isOwnGreen(px[(y + 6) * stride + xm])) { candX[nCand] = x - 11; candY[nCand] = y; nCand++ }
+                } } else run = 0
             }
         }
         // ---- мой персонаж: зелёная полоска хп + оранжевые патроны под ней ----
         var meX = w / 2.0; var meY = h / 2.0; var hp = -1f; var ammo = -1f
+        var bestScore = 0.0; var bk = -1; var bCols = 0
         for (k in 0 until nCand) {
+            val bar = barCols(px, stride, candX[k], candY[k])
+            if (bar < 30) continue
             val cols = ammoCols(px, stride, candX[k], candY[k])
-            if (cols >= 20) {
-                val xs = candX[k]; val yb = candY[k]
-                var best = 0
-                for (yy in yb + 1..min(h - 1, yb + 4)) best = max(best, runLen(px, stride, xs, yy))
-                hp = (best / (Layout.BAR_FULL * w)).toFloat().coerceIn(0f, 1f)
-                ammo = (cols / (0.0397f * w)).coerceIn(0f, 1f)
-                meX = xs + Layout.BAR_FULL * w / 2.0; meY = yb + h * 0.083
-                break
-            }
+            var score = bar + 2.0 * cols
+            // не прыгаем между кандидатами: предпочитаем тот, что рядом с прошлой позицией
+            if (lastPlayerSeen > 0 && now - lastPlayerSeen < 1500 && abs(candX[k] + Layout.BAR_FULL * w / 2.0 - pBarX) < w * 0.06 && abs(candY[k] - pBarY) < h * 0.06) score += 40.0
+            if (score > bestScore) { bestScore = score; bk = k; bCols = cols }
+        }
+        if (bk >= 0) {
+            val xs = candX[bk]; val yb = candY[bk]
+            var best = 0
+            for (yy in yb + 1..min(h - 1, yb + 4)) best = max(best, runLen(px, stride, xs, yy))
+            hp = (best / (Layout.BAR_FULL * w)).toFloat().coerceIn(0f, 1f)
+            ammo = (bCols / (0.0397f * w)).coerceIn(0f, 1f)   // пустая шкала = 0 патронов (а не "неизвестно")
+            meX = xs + Layout.BAR_FULL * w / 2.0; meY = yb + h * 0.083
+            pBarX = meX; pBarY = yb.toDouble()
         }
         meXf = meX; meYf = meY
         meBx = (meX / B).toInt().coerceIn(0, bwc - 1); meBy = (meY / B).toInt().coerceIn(0, bhc - 1)
@@ -485,7 +511,7 @@ class Brain(private val w: Int, private val h: Int) {
             if (d < 64 * 4 && moved < 2.0) {
                 if (stuckSince == 0L) stuckSince = now
                 if (now - stuckSince > 700) {
-                    escapeUntil = now + 800; escDir = if (Random.nextBoolean()) 1f else -1f; stuckSince = 0
+                    escapeUntil = now + 800; escDir = if (Random.nextBoolean()) 1f else -1f; stuckSince = 0; wAng += 1.6 * escDir
                 }
             } else stuckSince = 0
         }
@@ -496,7 +522,7 @@ class Brain(private val w: Int, private val h: Int) {
         var boxX = 0.0; var boxY = 0.0; var boxD = 1e9; var nb = 0
         for (i in 0 until nc) {
             val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
-            if (sn[i] < 40 || wd < w * 0.023 || wd < 2.5 * ht) continue
+            if (sn[i] < 20 || wd < w * 0.023 || wd < 2.5 * ht || ht > 9) continue
             // это МОИ полоски (патроны под хп): раньше принимались за ящик на расстоянии 0
             val cxb = (x0[i] + x1[i]) / 2.0
             if (hp >= 0f && abs(cxb - meX) < w * 0.03 && y0[i] > meY - h * 0.085 && y0[i] < meY - h * 0.03) continue
@@ -552,7 +578,7 @@ class Brain(private val w: Int, private val h: Int) {
         }
 
         val o = out
-        o.attack = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
+        o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
         if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
         prevHp = hp
@@ -625,10 +651,14 @@ class Brain(private val w: Int, private val h: Int) {
                 else pickMove(-gry / gd * strafe, grx / gd * strafe, 1.5, 0.0, 0.0, 0.0, 0.0)
             }
             else -> {
-                if (now - lastWander > 4500) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
-                val rx = cos(wAng) + 0.6 * cdx; val ry = sin(wAng) + 0.6 * cdy
-                val l = hypot(rx, ry).coerceAtLeast(1e-6)
-                pickMove(rx / l, ry / l, 1.5, 0.0, 0.0, 0.0, 0.0)
+                // идём прямо, пока путь свободен; упёрлись в стену - поворачиваем в более свободную сторону
+                if (now - lastWander > 9000) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
+                var tries = 0
+                while (tries < 6 && freeRun(cos(wAng), sin(wAng), 6) < 4) {
+                    val l = freeRun(cos(wAng + 0.8), sin(wAng + 0.8), 6); val r = freeRun(cos(wAng - 0.8), sin(wAng - 0.8), 6)
+                    wAng += if (l >= r) 0.8 else -0.8; tries++
+                }
+                pickMove(cos(wAng), sin(wAng), 2.5, 0.0, 0.0, 0.0, 0.0)
             }
         }
         if (state != "BOX") boxSince = 0L
@@ -676,10 +706,12 @@ class Brain(private val w: Int, private val h: Int) {
             o.ax = (grx / l).toFloat(); o.ay = (gry / l).toFloat(); o.attack = true; lastGhostShot = now
         } else if (state == "BOX" && boxD < h * Layout.SHOOT && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
             o.ax = (boxX / boxD).toFloat(); o.ay = (boxY / boxD).toFloat()
-            if (los(boxX, boxY)) o.attack = true
-            // ящик близко - тап, авто-наведение игры попадает надёжнее нашего свайпа;
-            // и даже если los() ошибся из-за ложной "стены", тап в упор всё равно достанет
-            if (boxD < h * 0.42f) { o.attack = true; o.attackTap = true }
+            // стреляем только если между нами нет стены (иначе пули уходят в блок и ящик не ломается)
+            if (los(boxX, boxY)) {
+                o.attack = true
+                // ящик близко - тап: авто-наведение игры попадает надёжнее свайпа
+                if (boxD < h * 0.42f) o.attackTap = true
+            }
         }
         return o
     }
