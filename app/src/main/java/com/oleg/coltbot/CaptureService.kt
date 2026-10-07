@@ -29,7 +29,9 @@ class CaptureService : Service() {
         @Volatile var frames = 0L; @Volatile var framesSaved = 0; @Volatile var recDir = ""
         @Volatile var lastAct = ""; @Volatile var recErr = ""
         @Volatile var lastMatch = ""; @Volatile var tunerInfo = ""
+        @Volatile var useYolo = false; @Volatile var yoloGpu = false; @Volatile var yoloInfo = ""
     }
+    private var yolo: Yolo? = null
     private var proj: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -87,6 +89,23 @@ class CaptureService : Service() {
         }
     }
 
+    // разметка и список классов лежат рядом с кадрами (формат YOLO: один .txt на кадр)
+    private fun saveText(name: String, text: String) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val cv = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                put(MediaStore.Downloads.RELATIVE_PATH, recBase)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), cv) ?: return
+            try { contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray()) } }
+            catch (e: Exception) { contentResolver.delete(uri, null, null) }
+        } else {
+            val d = legacyDir ?: return
+            File(d, name).writeText(text)
+        }
+    }
+
     private fun writeLog(line: String) {
         synchronized(logLock) {
             try { logOut?.write(line.toByteArray()); logOut?.flush() } catch (e: Exception) { recErr = e.javaClass.simpleName }
@@ -121,6 +140,19 @@ class CaptureService : Service() {
         val brain = Brain(cw, ch)
         val tuner = Tuner(getSharedPreferences("tuner", MODE_PRIVATE))
         brain.tuner = tuner
+        yolo = null; yoloInfo = ""
+        if (useYolo) {
+            val mf = File(filesDir, "yolo.tflite")
+            if (!mf.exists()) yoloInfo = "YOLO включена, но модель не загружена"
+            else try {
+                val y = Yolo(mf.absolutePath, yoloGpu, cw, ch)
+                yolo = y
+                yoloInfo = "YOLO26 / LiteRT (" + y.accel + ") запущена" + (if (y.err.isNotEmpty()) "; " + y.err else "")
+            } catch (t: Throwable) {
+                yoloInfo = "YOLO не запустилась: " + t.javaClass.simpleName + " " + (t.message ?: "")
+            }
+        }
+        var slowFrames = 0
         var bmp: Bitmap? = null; var px = IntArray(0)
         var last = 0L; var tick = 0
 
@@ -137,6 +169,20 @@ class CaptureService : Service() {
                         bmp!!.copyPixelsFromBuffer(p.buffer); img.close()
                         bmp!!.getPixels(px, 0, bw, 0, 0, bw, ch)
                         brain.mode = mode
+                        val yl = yolo
+                        if (yl != null) {
+                            try {
+                                brain.dets = yl.detect(px, bw)
+                                yoloInfo = "YOLO26 / LiteRT (" + yl.accel + "): %.0f мс, объектов %d".format(yl.ms, yl.count)
+                                // слишком медленно (>250 мс на кадр) - толку нет, возвращаемся к цветовым эвристикам
+                                if (yl.ms > 250f) slowFrames++ else slowFrames = 0
+                                if (slowFrames > 30) { yolo = null; brain.dets = null; yoloInfo = "YOLO отключена: слишком медленно (" + yl.accel + ", %.0f мс)".format(yl.ms) }
+                            } catch (t: Throwable) {
+                                brain.dets = null; yolo = null
+                                yoloInfo = "YOLO сбой, работаю на эвристиках: " + t.javaClass.simpleName + " " + (t.message ?: "") +
+                                    " (проверь экспорт: imgsz=(320,704), float32, nms=False)"
+                            }
+                        } else brain.dets = null
                         val a = brain.decide(px, bw, now)
                         lastMatch = brain.lastMatch; tunerInfo = tuner.summary()
                         st = a.state; sHp = a.hp; sAmmo = a.ammo; sEn = a.enemies; frames++
@@ -144,10 +190,17 @@ class CaptureService : Service() {
                         BotService.inst?.act(a, sw, sh)
                         if (record && tick % 4 == 0) {
                             ensureRec()
-                            val copy = bmp!!.copy(Bitmap.Config.ARGB_8888, false); val name = "f$tick.jpg"
+                            // ширина буфера бывает больше кадра (выравнивание строк): режем до реальной ширины, иначе разметка поедет
+                            val copy = if (bw == cw) bmp!!.copy(Bitmap.Config.ARGB_8888, false) else Bitmap.createBitmap(bmp!!, 0, 0, cw, ch)
+                            val name = "f$tick.jpg"; val lname = "f$tick.txt"; val lbl = brain.labelText()
                             val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo}}""" + "\n"
                             io?.execute { // запись на диск в отдельном потоке
-                                try { saveFrame(name, copy); framesSaved++ } catch (e: Exception) { recErr = e.javaClass.simpleName }
+                                try {
+                                    saveFrame(name, copy)
+                                    saveText(lname, lbl)
+                                    if (framesSaved == 0) saveText("classes.txt", Cls.NAMES.joinToString("\n") + "\n")
+                                    framesSaved++
+                                } catch (e: Exception) { recErr = e.javaClass.simpleName }
                                 copy.recycle()
                                 writeLog(line)
                             }
@@ -169,6 +222,7 @@ class CaptureService : Service() {
         reader?.setOnImageAvailableListener(null, null)
         try { io?.shutdown(); io?.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         synchronized(logLock) { try { logOut?.flush(); logOut?.close() } catch (_: Exception) {}; logOut = null }
+        yolo?.close(); yolo = null
         ht?.quitSafely(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
     }
 }

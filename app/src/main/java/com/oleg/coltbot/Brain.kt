@@ -34,6 +34,10 @@ class Brain(private val w: Int, private val h: Int) {
     val out = Action()
     /** Режим игры. Пока выставляется вручную (brain.mode = Mode.TEAM). */
     var mode = Mode.SHOWDOWN
+    /** Свежие детекции YOLO26 (LiteRT). null = детектор выключен: работают только цветовые эвристики. */
+    var dets: List<Det>? = null
+    /** Что нашли цветовые эвристики на этом кадре - автоматическая (грубая) разметка для обучения YOLO. */
+    val hDets = ArrayList<Det>()
 
     // ================= (1) ТРЕКИНГ ВРАГОВ =================
     private class Track {
@@ -392,6 +396,41 @@ class Brain(private val w: Int, private val h: Int) {
         return n
     }
 
+    // авторазметка для обучения YOLO: размер рамки берём от калиброванной ширины полоски хп (~1 клетка)
+    private fun lab(cls: Int, x: Double, y: Double) {
+        val bwid = (Layout.BAR_FULL * w * 0.95).toFloat()
+        hDets.add(Det(cls, x.toFloat(), y.toFloat(), bwid, if (cls == Cls.BOX) bwid else bwid * 1.15f, 1f))
+    }
+
+    /** Текст разметки в формате YOLO (класс cx cy w h, всё в долях кадра) для сохранённого кадра. */
+    fun labelText(): String {
+        val sb = StringBuilder()
+        for (d in hDets) {
+            val cx = d.cx / w; val cy = d.cy / h
+            if (cx < 0f || cx > 1f || cy < 0f || cy > 1f) continue
+            sb.append(String.format(java.util.Locale.US, "%d %.5f %.5f %.5f %.5f\n", d.cls, cx, cy, min(d.bw / w, 1f), min(d.bh / h, 1f)))
+        }
+        return sb.toString()
+    }
+
+    // уже есть враг (из YOLO) рядом с этой точкой - не дублируем цветовой находкой
+    private fun nearEnemy(n: Int, rx: Double, ry: Double): Boolean {
+        for (i in 0 until n) if (hypot(eX[i] - rx, eY[i] - ry) < h * 0.09) return true
+        return false
+    }
+
+    // хп врага, найденного YOLO: красная полоска прямо над ним; нет полоски - считаем полным
+    private fun barHpNear(d: Det): Double {
+        for (i in 0 until nc) {
+            val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
+            if (sn[i] < 20 || wd < w * 0.023 || wd < 2.5 * ht || ht > 9) continue
+            val cxb = (x0[i] + x1[i]) / 2.0
+            if (abs(cxb - d.cx) < d.bw * 0.7 + 4 && y0[i] < d.cy && y0[i] > d.cy - d.bh * 1.2 - 8)
+                return (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0)
+        }
+        return 1.0
+    }
+
     // привязка детекций к трекам: постоянные id, своя скорость у каждого врага
     private fun updateTracks(now: Long, nd: Int) {
         for (i in 0 until nd) {
@@ -448,7 +487,7 @@ class Brain(private val w: Int, private val h: Int) {
     }
 
     fun decide(px: IntArray, stride: Int, now: Long): Action {
-        nc = 0; java.util.Arrays.fill(pc, 0); java.util.Arrays.fill(wcnt, 0); java.util.Arrays.fill(bcnt, 0)
+        nc = 0; hDets.clear(); java.util.Arrays.fill(pc, 0); java.util.Arrays.fill(wcnt, 0); java.util.Arrays.fill(bcnt, 0)
         val dt = if (lastT > 0) ((now - lastT) / 1000.0).coerceAtMost(0.3) else 0.0
         if (stuckSince == 0L) { wx += lastMx * Layout.PLAYER_SPEED * h * dt; wy += lastMy * Layout.PLAYER_SPEED * h * dt }
         lastT = now
@@ -498,6 +537,7 @@ class Brain(private val w: Int, private val h: Int) {
             ammo = (bCols / (0.0397f * w)).coerceIn(0f, 1f)   // пустая шкала = 0 патронов (а не "неизвестно")
             meX = xs + Layout.BAR_FULL * w / 2.0; meY = yb + h * 0.083
             pBarX = meX; pBarY = yb.toDouble()
+            lab(Cls.ME, meX, meY)
         }
         meXf = meX; meYf = meY
         meBx = (meX / B).toInt().coerceIn(0, bwc - 1); meBy = (meY / B).toInt().coerceIn(0, bhc - 1)
@@ -532,8 +572,16 @@ class Brain(private val w: Int, private val h: Int) {
         val pl = hypot(pvx, pvy)
         if (pl > 1e-6) { pvux = pvx / pl; pvuy = pvy / pl } else { pvux = 0.0; pvuy = 0.0 }
         val inBush = bushB[meBy * bwc + meBx]
-        val cubeOk = cnn in 1..8
-        val dsx = if (cubeOk) csx / cnn else 0.0; val dsy = if (cubeOk) csy / cnn else 0.0
+        // кубок: если YOLO его видит - берём ближайший, иначе старый цветовой поиск по блокам
+        var yCube = false; var ycx = 0.0; var ycy = 0.0; var ycd = 1e9
+        val yd0 = dets
+        if (yd0 != null) for (d in yd0) if (d.cls == Cls.CUBE) {
+            val dd = hypot(d.cx - meX, d.cy - meY)
+            if (dd < ycd && dd > h * 0.03) { ycd = dd; ycx = d.cx.toDouble(); ycy = d.cy.toDouble(); yCube = true }
+        }
+        val cubeOk = yCube || cnn in 1..8
+        val dsx = if (yCube) ycx else if (cubeOk) csx / cnn else 0.0
+        val dsy = if (yCube) ycy else if (cubeOk) csy / cnn else 0.0
         val dn = if (cubeOk) 1 else 0
 
         // ---- застревание: экран не скроллится И я на месте ----
@@ -555,6 +603,18 @@ class Brain(private val w: Int, private val h: Int) {
         // ---- враги (есть имя) и ящики (имени нет) ----
         var nd = 0
         var boxX = 0.0; var boxY = 0.0; var boxD = 1e9; var nb = 0
+        // YOLO: враги и ящики по самому телу (центр точный, не зависит от цвета полоски хп)
+        var yBox = false
+        val yd = dets
+        if (yd != null) for (d in yd) {
+            val rx = d.cx - meX; val ry = d.cy - meY; val dd = hypot(rx, ry)
+            if (d.cls == Cls.ENEMY && nd < N && dd > h * 0.06) {
+                eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d); nd++
+            } else if (d.cls == Cls.BOX && dd > h * 0.08 && d.cy > h * 0.12) {
+                yBox = true; nb++
+                if (dd < boxD) { boxD = dd; boxX = rx; boxY = ry }
+            }
+        }
         for (i in 0 until nc) {
             val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
             if (sn[i] < 20 || wd < w * 0.023 || wd < 2.5 * ht || ht > 9) continue
@@ -569,11 +629,13 @@ class Brain(private val w: Int, private val h: Int) {
             val rx = x0[i] + Layout.BAR_FULL * w / 2.0 - meX; val ry = y0[i] + h * 0.085 - meY
             val d = hypot(rx, ry)
             if (pink >= 6) {
-                if (nd < N) { eX[nd] = rx; eY[nd] = ry; eH[nd] = (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0); nd++ }
+                lab(Cls.ENEMY, meX + rx, meY + ry)
+                if (nd < N && !nearEnemy(nd, rx, ry)) { eX[nd] = rx; eY[nd] = ry; eH[nd] = (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0); nd++ }
             } else {
                 // ящик: тонкая полоска хп, не у самого себя, не в декоре сверху (тыквы/надгробия), полоска не толстая
                 if (d < h * 0.10 || y0[i] < h * 0.19 || ht > max(6.0, h * 0.025)) continue
-                nb++; if (d < boxD) { boxD = d; boxX = rx; boxY = ry }
+                lab(Cls.BOX, meX + rx, meY + ry)
+                if (!yBox) { nb++; if (d < boxD) { boxD = d; boxX = rx; boxY = ry } }
             }
         }
 

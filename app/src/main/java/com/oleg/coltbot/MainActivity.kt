@@ -16,6 +16,7 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.*
+import java.io.File
 
 class MainActivity : Activity() {
     private val cBg = Color.parseColor("#0F1220"); private val cCard = Color.parseColor("#1A1F36")
@@ -36,7 +37,7 @@ class MainActivity : Activity() {
     private lateinit var tvState: TextView; private lateinit var tvHp: TextView; private lateinit var tvAmmo: TextView
     private lateinit var tvEn: TextView; private lateinit var tvFps: TextView
     private lateinit var barHp: ProgressBar; private lateinit var barAmmo: ProgressBar
-    private lateinit var tvFrames: TextView; private lateinit var tvPath: TextView; private lateinit var tvDiag: TextView
+    private lateinit var tvFrames: TextView; private lateinit var tvPath: TextView; private lateinit var tvYolo: TextView; private lateinit var tvDiag: TextView
     private var prevT = 0L; private var prevF = 0L; private var fps = 0
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -94,6 +95,8 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("s", Context.MODE_PRIVATE)
         CaptureService.record = prefs.getBoolean("rec", false)
         CaptureService.mode = if (prefs.getBoolean("team", false)) Mode.TEAM else Mode.SHOWDOWN
+        CaptureService.useYolo = prefs.getBoolean("yolo", false)
+        CaptureService.yoloGpu = prefs.getBoolean("ygpu", false)
 
         // ----- левая колонка: статус и управление -----
         val left = column()
@@ -141,12 +144,47 @@ class MainActivity : Activity() {
         set.addView(tvFrames); set.addView(tvPath)
         right.addView(set)
 
+        val yc = card("ДЕТЕКТОР YOLO26 (LiteRT)")
+        yc.addView(sw("Использовать YOLO (нужна модель)", CaptureService.useYolo) { c ->
+            CaptureService.useYolo = c; prefs.edit().putBoolean("yolo", c).apply()
+        })
+        yc.addView(sw("Считать на GPU (быстрее, но не на всех телефонах)", CaptureService.yoloGpu) { c ->
+            CaptureService.yoloGpu = c; prefs.edit().putBoolean("ygpu", c).apply()
+        })
+        tvYolo = label("", 12f, cMuted)
+        yc.addView(tvYolo)
+        yc.addView(button("Загрузить модель (.tflite)", cBlue) {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 2)
+        })
+        right.addView(yc)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; setPadding(dp(16), dp(16), dp(16), dp(16))
             addView(left); addView(right)
         }
         setContentView(ScrollView(this).apply { setBackgroundColor(cBg); isFillViewport = true; addView(root) })
         requestPermissions(if (android.os.Build.VERSION.SDK_INT < 29) arrayOf("android.permission.POST_NOTIFICATIONS", "android.permission.WRITE_EXTERNAL_STORAGE") else arrayOf("android.permission.POST_NOTIFICATIONS"), 0)
+    }
+
+    // копируем выбранный .tflite во внутреннюю папку приложения (оттуда его читает LiteRT)
+    private fun loadModel(uri: android.net.Uri) {
+        try {
+            val tmp = File(filesDir, "yolo.tflite.tmp")
+            contentResolver.openInputStream(uri)?.use { ins -> tmp.outputStream().use { ins.copyTo(it) } }
+            val hd = ByteArray(8)
+            val n = tmp.inputStream().use { it.read(hd) }
+            // у файлов LiteRT/TFLite на смещении 4 стоит сигнатура "TFL3"
+            if (n < 8 || String(hd, 4, 4) != "TFL3") {
+                tmp.delete()
+                Toast.makeText(this, "Это не .tflite модель", Toast.LENGTH_LONG).show(); return
+            }
+            val dst = File(filesDir, "yolo.tflite")
+            if (dst.exists()) dst.delete()
+            tmp.renameTo(dst)
+            Toast.makeText(this, "Модель загружена. Включи YOLO и перезапусти бота", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Не удалось загрузить: " + e.javaClass.simpleName, Toast.LENGTH_LONG).show()
+        }
     }
 
     // служба реально подключена только если жив BotService.inst (строка в настройках может остаться после переустановки)
@@ -195,12 +233,21 @@ class MainActivity : Activity() {
             (if (CaptureService.recErr.isNotEmpty()) "\nОшибка: ${CaptureService.recErr}" else "") +
             (if (CaptureService.lastMatch.isNotEmpty()) "\nПоследний матч: ${CaptureService.lastMatch}" else "") +
             (if (CaptureService.tunerInfo.isNotEmpty()) "\nСамонастройка: ${CaptureService.tunerInfo}" else "")
+        val mf = File(filesDir, "yolo.tflite")
+        tvYolo.text = (if (mf.exists()) "Модель: " + "%.1f".format(mf.length() / 1048576.0) + " МБ" else "Модель не загружена") +
+            (if (CaptureService.yoloInfo.isNotEmpty()) "\n" + CaptureService.yoloInfo else "") +
+            "\nБез модели (или если YOLO не запустилась) бот играет по цветовым эвристикам, как раньше. Настройки применяются при следующем старте."
         tvFrames.text = "Сохранено кадров: ${CaptureService.framesSaved}"
         tvPath.text = "Папка: " + (CaptureService.recDir.ifEmpty { "Загрузки/Brawlbot/ (появится при записи)" })
     }
 
     @Deprecated("old api")
     override fun onActivityResult(rq: Int, rc: Int, d: Intent?) {
+        if (rq == 2 && rc == RESULT_OK) {
+            val uri = d?.data
+            if (uri != null) loadModel(uri)
+            return
+        }
         if (rq == 1 && rc == RESULT_OK && d != null) {
             startForegroundService(Intent(this, CaptureService::class.java).putExtra("code", rc).putExtra("data", d))
         }
