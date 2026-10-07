@@ -28,6 +28,7 @@ class CaptureService : Service() {
         @Volatile var st = "ROAM"; @Volatile var sHp = -1f; @Volatile var sAmmo = -1f; @Volatile var sEn = 0
         @Volatile var frames = 0L; @Volatile var framesSaved = 0; @Volatile var recDir = ""
         @Volatile var lastAct = ""; @Volatile var recErr = ""
+        @Volatile var lastMatch = ""; @Volatile var tunerInfo = ""
     }
     private var proj: MediaProjection? = null
     private var vd: VirtualDisplay? = null
@@ -118,6 +119,8 @@ class CaptureService : Service() {
         io = Executors.newSingleThreadExecutor()
         framesSaved = 0; frames = 0; running = true; recDir = ""; recErr = ""; recOpen = false
         val brain = Brain(cw, ch)
+        val tuner = Tuner(getSharedPreferences("tuner", MODE_PRIVATE))
+        brain.tuner = tuner
         var bmp: Bitmap? = null; var px = IntArray(0)
         var last = 0L; var tick = 0
 
@@ -135,6 +138,7 @@ class CaptureService : Service() {
                         bmp!!.getPixels(px, 0, bw, 0, 0, bw, ch)
                         brain.mode = mode
                         val a = brain.decide(px, bw, now)
+                        lastMatch = brain.lastMatch; tunerInfo = tuner.summary()
                         st = a.state; sHp = a.hp; sAmmo = a.ammo; sEn = a.enemies; frames++
                         lastAct = "дв=(%.1f; %.1f)".format(a.mx, a.my) + (if (a.attack) " огонь" else "") + (if (a.sup) " супер" else "") + (if (a.gadget) " гаджет" else "")
                         BotService.inst?.act(a, sw, sh)

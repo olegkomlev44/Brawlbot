@@ -107,6 +107,10 @@ class MainActivity : Activity() {
         left.addView(button("Открыть спецвозможности", cBlue) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) })
         btnStart = button("▶  Старт", cGreen) { onStartStop() }
         left.addView(btnStart)
+        left.addView(button("Сбросить самонастройку", cRed) {
+            getSharedPreferences("tuner", MODE_PRIVATE).edit().clear().apply()
+            Toast.makeText(this, "Сброшено: применится при следующем старте бота", Toast.LENGTH_LONG).show()
+        })
         left.addView(button("Проверить управление (джойстик)", cBlue) {
             val b = BotService.inst
             if (b == null) Toast.makeText(this, "Служба спецвозможностей не подключена: выключи и включи Colt Bot заново", Toast.LENGTH_LONG).show()
@@ -188,7 +192,9 @@ class MainActivity : Activity() {
         }
         tvDiag.text = "Решение: ${CaptureService.lastAct}\nЖесты: отправлено ${BotService.sent}, выполнено ${BotService.done}, отменено ${BotService.cancelled}, отклонено ${BotService.rejected}" +
             (if (BotService.lastErr.isNotEmpty()) "\nОшибка жеста: ${BotService.lastErr}" else "") +
-            (if (CaptureService.recErr.isNotEmpty()) "\nОшибка: ${CaptureService.recErr}" else "")
+            (if (CaptureService.recErr.isNotEmpty()) "\nОшибка: ${CaptureService.recErr}" else "") +
+            (if (CaptureService.lastMatch.isNotEmpty()) "\nПоследний матч: ${CaptureService.lastMatch}" else "") +
+            (if (CaptureService.tunerInfo.isNotEmpty()) "\nСамонастройка: ${CaptureService.tunerInfo}" else "")
         tvFrames.text = "Сохранено кадров: ${CaptureService.framesSaved}"
         tvPath.text = "Папка: " + (CaptureService.recDir.ifEmpty { "Загрузки/Brawlbot/ (появится при записи)" })
     }

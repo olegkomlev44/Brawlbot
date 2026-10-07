@@ -9,13 +9,15 @@ object Layout {
     const val ATK_X = 0.84f; const val ATK_Y = 0.625f
     const val SUP_X = 0.71f; const val SUP_Y = 0.736f
     const val GAD_X = 0.79f; const val GAD_Y = 0.88f
-    const val TOO_CLOSE = 0.32f; const val TOO_FAR = 0.55f; const val SHOOT = 0.70f
+    const val TOO_CLOSE = 0.32f; const val TOO_FAR = 0.55f; const val SHOOT = 0.74f   // дальность Кольта ~11 клеток
     const val PLAYER_SPEED = 0.25f; const val BULLET_SPEED = 1.2f
     const val BAR_FULL = 0.0457f     // ширина полной полоски хп в долях ширины кадра
     const val LATENCY = 0.20f      // кадр + расчёт + свайп + доставка жеста (выстрел происходит при ОТПУСКАНИИ пальца)
     const val SLOT_DMG = 0.30f
     // --- новое ---
     const val FIRE_MIN_AMMO = 0.32f  // выстрел возможен от одного полного слота (1/3 шкалы)
+    // Speedloader: true = старая версия (мгновенно перезаряжает 2 патрона); false = актуальная (2 быстрых выстрела с замедлением)
+    const val GADGET_RELOADS = false
     const val GADGET_CHARGES = 3     // зарядов гаджета за матч
     const val MATCH_GAP_MS = 6000L   // если персонаж не виден дольше - считаем, что начался новый матч
 }
@@ -64,7 +66,15 @@ class Brain(private val w: Int, private val h: Int) {
     private var cdx = 0.0; private var cdy = 0.0
     private var wx = 0.0; private var wy = 0.0; private var lastT = 0L
     private var lastGhostShot = 0L
+    private var retreatSince = 0L; private var standUntil = 0L
     private var pBarX = 0.0; private var pBarY = 0.0
+    // самонастройка: параметры тактики и статистика матча для награды
+    var tuner: Tuner? = null
+    @Volatile var lastMatch = ""
+    private val defParams = Params()
+    private val prm: Params get() = tuner?.current ?: defParams
+    private var dealt = 0.0; private var taken = 0.0; private var kills = 0; private var shots = 0
+    private var lastAttackAt = 0L; private var matchFinished = true
     private var boxSince = 0L; private var boxIgnoreUntil = 0L   // таймаут: не залипать на недостижимом ящике
     private var matchStart = 0L; private var lastPlayerSeen = 0L; private var gadgetCharges = Layout.GADGET_CHARGES
 
@@ -92,10 +102,23 @@ class Brain(private val w: Int, private val h: Int) {
 
     private fun matchReset(now: Long) {
         tracks.clear(); vis.clear(); tg = null
-        gadgetCharges = Layout.GADGET_CHARGES; matchStart = now
+        gadgetCharges = Layout.GADGET_CHARGES; matchStart = now; retreatSince = 0L; standUntil = 0L
+        dealt = 0.0; taken = 0.0; kills = 0; shots = 0; lastAttackAt = 0L; matchFinished = false
         wx = 0.0; wy = 0.0; lastSuper = 0L; lastGadget = 0L; evadeUntil = 0L
         hpMark = -1f; healing = false; escapeUntil = 0L; stuckSince = 0L; prevHp = -1f
         boxSince = 0L; boxIgnoreUntil = 0L
+    }
+
+    // итог матча: награда -> самонастройка. Победу/место определить не из чего (нужен скрин итогового экрана),
+    // поэтому награда считается по измеряемому: урон по врагам, оценка убийств, выживание, полученный урон
+    private fun finishMatch(now: Long) {
+        matchFinished = true
+        val aliveS = (lastPlayerSeen - matchStart) / 1000.0
+        if (aliveS < 15.0) return   // меню/шум, не матч
+        val reward = dealt + 1.5 * kills - 0.6 * taken + min(aliveS / 60.0, 3.0)
+        val note = tuner?.report(reward) ?: ""
+        lastMatch = "жил " + "%.0f".format(aliveS) + " с, урон " + "%.1f".format(dealt) + ", убийств~" + kills +
+            ", получено " + "%.1f".format(taken) + ", выстрелов " + shots + " -> награда " + "%.2f".format(reward) + " (" + note + ")"
     }
 
     // ================= (2) КАРТА: LOS и A* =================
@@ -406,11 +429,22 @@ class Brain(private val w: Int, private val h: Int) {
                     // быстрое сглаживание: при 10-11 к/с alpha 0.45 даёт ~0.25 c лага в оценке скорости
                     t.vx += 0.70 * (mvx - t.vx); t.vy += 0.70 * (mvy - t.vy)
                 }
+                val drop = t.hp - eH[i]   // у врага просела полоска хп сразу после нашего выстрела - засчитываем урон
+                if (drop > 0.04 && drop < 0.7 && now - lastAttackAt < 800) dealt += drop
                 t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = eH[i]
                 t.hits++; t.last = now; t.stamp = now
             }
         }
-        tracks.removeAll { now - it.last > 2500 }
+        var tk = tracks.size - 1
+        while (tk >= 0) {
+            val t = tracks[tk]
+            if (now - t.last > 2500) {
+                // пропал почти без хп и мы недавно по нему стреляли - вероятно убит
+                if (t.hits >= 4 && t.hp <= 0.25 && lastAttackAt >= t.last - 1500) kills++
+                tracks.removeAt(tk)
+            }
+            tk--
+        }
     }
 
     fun decide(px: IntArray, stride: Int, now: Long): Action {
@@ -467,9 +501,10 @@ class Brain(private val w: Int, private val h: Int) {
         }
         meXf = meX; meYf = meY
         meBx = (meX / B).toInt().coerceIn(0, bwc - 1); meBy = (meY / B).toInt().coerceIn(0, bhc - 1)
+        if (hp < 0f && !matchFinished && matchStart > 0L && lastPlayerSeen > 0L && now - lastPlayerSeen > Layout.MATCH_GAP_MS) finishMatch(now)
         if (hp >= 0f) {
             // (6) новый матч: персонаж долго не был виден (меню/смерть) -> сбрасываем состояние
-            if (lastPlayerSeen == 0L || now - lastPlayerSeen > Layout.MATCH_GAP_MS) matchReset(now)
+            if (lastPlayerSeen == 0L || now - lastPlayerSeen > Layout.MATCH_GAP_MS) { if (!matchFinished && matchStart > 0L) finishMatch(now); matchReset(now) }
             lastPlayerSeen = now
             if (hp < 0.6f) healing = true else if (hp > 0.9f) healing = false
             if (now - hpMarkT > 1500) { if (hpMark >= 0f && hpMark - hp > 0.25f) evadeUntil = now + 2000; hpMark = hp; hpMarkT = now }
@@ -581,22 +616,36 @@ class Brain(private val w: Int, private val h: Int) {
         o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
         if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
+        if (hp >= 0f && prevHp >= 0f && hp < prevHp - 0.05f) taken += (prevHp - hp)
         prevHp = hp
         val dist = (bd / h).toFloat()
         val low = hp in 0f..0.35f
+
+        // "убежать нельзя": я отступаю, а враг всё равно сближается -> он не медленнее меня (рывок/быстрый боец).
+        // Бег в этом случае = бесплатный урон, поэтому ~2.5 с стоим, стреляем и тратим гаджет/супер
+        if (tgt != null) {
+            val spd = Layout.PLAYER_SPEED * h.toDouble()
+            val myvx = if (stuckSince == 0L) lastMx * spd else 0.0; val myvy = if (stuckSince == 0L) lastMy * spd else 0.0
+            val closing = -((tgt.vx - myvx) * ux + (tgt.vy - myvy) * uy)   // > 0: дистанция сокращается
+            val retreating = lastMx * ux + lastMy * uy < -0.3
+            if (retreating && closing > spd * 0.10 && dist < 0.55f) {
+                if (retreatSince == 0L) retreatSince = now else if (now - retreatSince > 700) { standUntil = now + prm.standMs.toLong(); retreatSince = 0L }
+            } else retreatSince = 0L
+        }
 
         // ================= (6) ТАКТИКА: фаза матча и агрессивность =================
         val phase = if (matchStart > 0) (now - matchStart) / 1000.0 else 999.0
         var aggr = if (mode == Mode.SHOWDOWN) (if (phase < 40) 0.30 else if (phase < 100) 0.60 else 0.80) else 0.80
         if (hp >= 0f) aggr *= (0.5 + 0.5 * hp)
         if (ne >= 2) aggr *= 0.7
+        aggr = (aggr * prm.aggrMul).coerceIn(0.1, 1.0)
         // в начале шоудауна сначала лутаем кубки/ящики, а с врагами не лезем в драку
         val lootFirst = mode == Mode.SHOWDOWN && aggr < 0.45 && (dn > 0 || nb > 0) && (ne == 0 || (dist > 0.30f && now >= evadeUntil))
         val dropFirst = dn > 0 && (ne == 0 || dist > 0.25f)
         val state = when {
             pn >= 3 -> "POISON"
             pinch -> "PINCH"
-            ne > 0 && (low || ne >= 3 || now < evadeUntil) -> "EVADE"
+            ne > 0 && now >= standUntil && (low || ne >= 3 || now < evadeUntil) -> "EVADE"
             healing && ne == 0 && bushD < 1e8 -> "HIDE"
             lootFirst && dn > 0 -> "DROP"
             lootFirst -> "BOX"
@@ -631,9 +680,10 @@ class Brain(private val w: Int, private val h: Int) {
             }
             "ATTACK" -> {
                 val band = when {
+                    now < standUntil -> max(0.25, min(dist.toDouble(), 0.50))   // не бежим от того, от кого не убежать
                     !engage -> 0.62
                     reload -> 0.60
-                    else -> Layout.TOO_CLOSE + 0.10 + 0.14 * (1.0 - aggr)
+                    else -> prm.bandBase + 0.14 * (1.0 - aggr)
                 }
                 // стена между нами - идём обходом; иначе дистанцию держит сама оценка направлений
                 if (tgt != null && engage && !reload && dist > band + 0.08) goalToward(tgt.rx, tgt.ry, now, ne > 1)
@@ -642,8 +692,8 @@ class Brain(private val w: Int, private val h: Int) {
                 // стрейф только короткими перебежками (иначе бот "наворачивает круги" и сам себе мажет прицел)
                 val hold = tgt != null && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
                         los(tgt.rx, tgt.ry) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
-                pickMove(gdx, gdy, wg, band, 3.0, if (hold) 0.15 else 0.6, if (reload || !engage) 1.8 else 0.2)
-                if (hold && Random.nextFloat() < 0.65f) moving = false
+                pickMove(gdx, gdy, wg, band, 3.0, (if (hold) 0.15 else 0.6) * prm.strafeMul, if (reload || !engage) 1.8 else 0.2)
+                if (hold && Random.nextFloat() < prm.holdProb) moving = false
             }
             "GHOST" -> {
                 val gd = hypot(grx, gry).coerceAtLeast(1.0)
@@ -693,12 +743,18 @@ class Brain(private val w: Int, private val h: Int) {
                 // или почти смертельная опасность (ульт Кольта ломает стены и отпугивает)
                 if (now - lastSuper > 2500 &&
                     (value >= 2 || (value >= 1 && (tgt.hp <= 0.60 || behindWall || (sight && dist < 0.6f && ne == 1))) ||
-                     (low && sight && dist < 0.45f))) {
+                     (low && sight && dist < 0.45f) || (now < standUntil && sight && dist < 0.55f))) {
                     o.sup = true; lastSuper = now
                 }
-                // гаджет (speedloader): патроны кончаются в бою ИЛИ мало хп и надо дожать/отбиться
-                val wantGadget = gadgetCharges > 0 && dist < 0.65f && now - lastGadget > 2000 &&
-                        ((ammo in 0f..0.40f && (sight || dist < 0.45f)) || (low && ammo in 0f..0.67f))
+                val standingNow = now < standUntil
+                val wantGadget = gadgetCharges > 0 && now - lastGadget > 2000 && (
+                    if (Layout.GADGET_RELOADS)
+                        dist < 0.65f && ((ammo in 0f..0.40f && (sight || dist < 0.45f)) || (low && ammo in 0f..0.67f))
+                    else
+                        // актуальный Speedloader: два быстрых выстрела с замедлением - когда враг уже рядом
+                        // (сближается, добиваем или отбиваемся)
+                        sight && dist in 0.10f..0.45f && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO) &&
+                            (standingNow || low || tgt.hp <= 0.5 || dist < 0.30f))
                 if (wantGadget) { o.gadget = true; lastGadget = now; gadgetCharges-- }
             }
         } else if (state == "GHOST" && hypot(grx, gry) < h * Layout.SHOOT && now - lastGhostShot > 700 && (ammo < 0f || ammo > 0.5f)) {
@@ -713,6 +769,7 @@ class Brain(private val w: Int, private val h: Int) {
                 if (boxD < h * 0.42f) o.attackTap = true
             }
         }
+        if (o.attack) { lastAttackAt = now; shots++ }
         return o
     }
 }
