@@ -2,11 +2,15 @@ package com.oleg.coltbot
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Context
 import android.content.Intent
+import android.graphics.PixelFormat
 import android.graphics.Path
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 
 class BotService : AccessibilityService() {
@@ -24,19 +28,54 @@ class BotService : AccessibilityService() {
         override fun onCompleted(g: GestureDescription?) { done++; busy = false }
         override fun onCancelled(g: GestureDescription?) { cancelled++; busy = false; stroke = null }
     }
+    // защёлки: решение принято, а жест в этот момент занят - раньше супер/гаджет/выстрел просто терялись
+    private var pAtk = false; private var pAtkT = 0L; private var pAx = 0f; private var pAy = 0f; private var pTap = false
+    private var pSup = false; private var pSupT = 0L; private var pSx = 0f; private var pSy = 0f
+    private var pGad = false; private var pGadT = 0L
+
+    // ---- оверлей «что видит бот» (окно спецвозможностей: отдельного разрешения не нужно) ----
+    private var ovView: OverlayView? = null
+    fun setOverlay(on: Boolean) {
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                if (on && ovView == null) {
+                    val v = OverlayView(this)
+                    val lp = WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        PixelFormat.TRANSLUCENT)
+                    if (Build.VERSION.SDK_INT >= 28) lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    wm.addView(v, lp); ovView = v
+                } else if (!on && ovView != null) {
+                    wm.removeView(ovView); ovView = null
+                }
+            } catch (e: Exception) { lastErr = "оверлей: " + e.javaClass.simpleName + " " + (e.message ?: "") }
+        }
+    }
+    fun overlayUpdate(d: OverlayData) { val v = ovView; if (v != null) { v.data = d; v.postInvalidate() } }
+
     override fun onServiceConnected() { inst = this }
-    override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+    override fun onUnbind(intent: Intent?): Boolean { setOverlay(false); inst = null; return super.onUnbind(intent) }
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
     override fun onInterrupt() {}
 
     fun act(a: Action, w: Int, h: Int) {
         val now = SystemClock.elapsedRealtime()
+        if (a.attack) { pAtk = true; pAtkT = now; pAx = a.ax; pAy = a.ay; pTap = a.attackTap } else pAtk = false
+        if (a.sup) { pSup = true; pSupT = now; pSx = a.ax; pSy = a.ay }
+        if (a.gadget) { pGad = true; pGadT = now }
         if (busy) {
             if (now - busySince < 500) return
             busy = false; stroke = null          // коллбек потерялся - не зависаем навсегда
         }
         try {
             val r = h * 0.10f; val jx = w * Layout.JOY_X; val jy = h * Layout.JOY_Y
+            // прицел длиннее джойстика: чем длиннее свайп, тем меньше угловая ошибка от неточного центра кнопки
+            val ra = h * 0.16f
+            val atk = pAtk && now - pAtkT < 250; val sup = pSup && now - pSupT < 900; val gad = pGad && now - pGadT < 900
             val g = GestureDescription.Builder(); var n = 0
             val move = a.mx * a.mx + a.my * a.my > 0.01f
             if (move || stroke != null) {
@@ -49,26 +88,27 @@ class BotService : AccessibilityService() {
                 stroke = if (move) s else null; fx = tx; fy = ty
             }
             // выстрел происходит при ОТПУСКАНИИ пальца, поэтому свайпы короткие (70 мс): меньше задержка прицела
-            if (a.attack) {
+            if (atk) {
                 val p = Path(); val cx = w * Layout.ATK_X; val cy = h * Layout.ATK_Y
                 p.moveTo(cx, cy)
-                if (a.attackTap) {
+                if (pTap) {
                     // тап = встроенное авто-наведение игры (точно бьёт в упор и по ящикам)
                     g.addStroke(GestureDescription.StrokeDescription(p, 0, 40)); n++
                 } else {
-                    p.lineTo(cx + a.ax * r, cy + a.ay * r)
+                    p.lineTo(cx + pAx * ra, cy + pAy * ra)
                     g.addStroke(GestureDescription.StrokeDescription(p, 0, 70)); n++
                 }
             }
-            if (a.sup) { // супер свайпом с упреждением, как обычная атака
+            if (sup) { // супер свайпом с упреждением, как обычная атака
                 val p = Path(); val cx = w * Layout.SUP_X; val cy = h * Layout.SUP_Y
-                p.moveTo(cx, cy); p.lineTo(cx + a.ax * r, cy + a.ay * r)
+                p.moveTo(cx, cy); p.lineTo(cx + pSx * ra, cy + pSy * ra)
                 g.addStroke(GestureDescription.StrokeDescription(p, 0, 70)); n++
             }
-            if (a.gadget) { val p = Path(); p.moveTo(w * Layout.GAD_X, h * Layout.GAD_Y); g.addStroke(GestureDescription.StrokeDescription(p, 0, 50)); n++ }
+            if (gad) { val p = Path(); p.moveTo(w * Layout.GAD_X, h * Layout.GAD_Y); g.addStroke(GestureDescription.StrokeDescription(p, 0, 50)); n++ }
             if (n > 0) {
                 busy = true; busySince = now; sent++
                 if (!dispatchGesture(g.build(), cb, null)) { busy = false; stroke = null; rejected++ }
+                else { if (atk) pAtk = false; if (sup) pSup = false; if (gad) pGad = false }
             }
         } catch (e: Exception) {
             lastErr = e.javaClass.simpleName + ": " + (e.message ?: ""); busy = false; stroke = null

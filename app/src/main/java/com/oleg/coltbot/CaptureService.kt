@@ -30,6 +30,7 @@ class CaptureService : Service() {
         @Volatile var lastAct = ""; @Volatile var recErr = ""
         @Volatile var lastMatch = ""; @Volatile var tunerInfo = ""
         @Volatile var useYolo = false; @Volatile var yoloGpu = false; @Volatile var yoloInfo = ""
+        @Volatile var yoloStretch = true; @Volatile var overlay = false
     }
     private var yolo: Yolo? = null
     private var proj: MediaProjection? = null
@@ -145,14 +146,17 @@ class CaptureService : Service() {
             val mf = File(filesDir, "yolo.tflite")
             if (!mf.exists()) yoloInfo = "YOLO включена, но модель не загружена"
             else try {
-                val y = Yolo(mf.absolutePath, yoloGpu, cw, ch)
+                val y = Yolo(mf.absolutePath, yoloGpu, cw, ch, yoloStretch)
                 yolo = y
-                yoloInfo = "YOLO26 / LiteRT (" + y.accel + ") запущена" + (if (y.err.isNotEmpty()) "; " + y.err else "")
+                yoloInfo = "YOLO26 / LiteRT (" + y.accel + ") запущена: классов " + y.names.size + ", вход " + y.info.iw + "x" + y.info.ih +
+                    (if (y.info.nchw) " NCHW" else " NHWC") + (if (yoloStretch) ", растяжение" else ", с полями") +
+                    (if (y.err.isNotEmpty()) "; " + y.err else "")
             } catch (t: Throwable) {
                 yoloInfo = "YOLO не запустилась: " + t.javaClass.simpleName + " " + (t.message ?: "")
             }
         }
         var slowFrames = 0
+        BotService.inst?.setOverlay(overlay)
         var bmp: Bitmap? = null; var px = IntArray(0)
         var last = 0L; var tick = 0
 
@@ -180,7 +184,7 @@ class CaptureService : Service() {
                             } catch (t: Throwable) {
                                 brain.dets = null; yolo = null
                                 yoloInfo = "YOLO сбой, работаю на эвристиках: " + t.javaClass.simpleName + " " + (t.message ?: "") +
-                                    " (проверь экспорт: imgsz=(320,704), float32, nms=False)"
+                                    " (нужна float32-модель YOLO26 с выходом [1, 4+классы, якоря] или [1,300,6])"
                             }
                         } else brain.dets = null
                         val a = brain.decide(px, bw, now)
@@ -188,6 +192,19 @@ class CaptureService : Service() {
                         st = a.state; sHp = a.hp; sAmmo = a.ammo; sEn = a.enemies; frames++
                         lastAct = "дв=(%.1f; %.1f)".format(a.mx, a.my) + (if (a.attack) " огонь" else "") + (if (a.sup) " супер" else "") + (if (a.gadget) " гаджет" else "")
                         BotService.inst?.act(a, sw, sh)
+                        if (overlay) {
+                            val od = OverlayData()
+                            od.capW = cw; od.capH = ch
+                            od.dets = ArrayList<Det>(brain.dets ?: emptyList<Det>())
+                            od.heur = ArrayList<Det>(brain.hDets)
+                            od.meX = a.meX; od.meY = a.meY
+                            od.mx = a.mx; od.my = a.my; od.ax = a.ax; od.ay = a.ay; od.attack = a.attack
+                            od.hud = a.state + "  хп " + (if (a.hp >= 0f) "" + (a.hp * 100).toInt() + "%" else "?") +
+                                "  патр " + (if (a.ammo >= 0f) "%.1f".format(a.ammo * 3) else "?") + "  врагов " + a.enemies + "\n" +
+                                (if (yoloInfo.isNotEmpty()) yoloInfo else "YOLO выключена: только цветовые эвристики") + "\n" +
+                                "жесты " + BotService.sent + "/" + BotService.done + "  отмен " + BotService.cancelled
+                            BotService.inst?.overlayUpdate(od)
+                        }
                         if (record && tick % 4 == 0) {
                             ensureRec()
                             // ширина буфера бывает больше кадра (выравнивание строк): режем до реальной ширины, иначе разметка поедет
@@ -223,6 +240,7 @@ class CaptureService : Service() {
         try { io?.shutdown(); io?.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         synchronized(logLock) { try { logOut?.flush(); logOut?.close() } catch (_: Exception) {}; logOut = null }
         yolo?.close(); yolo = null
+        BotService.inst?.setOverlay(false)
         ht?.quitSafely(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
     }
 }

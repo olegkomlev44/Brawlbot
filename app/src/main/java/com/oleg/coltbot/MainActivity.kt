@@ -97,6 +97,8 @@ class MainActivity : Activity() {
         CaptureService.mode = if (prefs.getBoolean("team", false)) Mode.TEAM else Mode.SHOWDOWN
         CaptureService.useYolo = prefs.getBoolean("yolo", false)
         CaptureService.yoloGpu = prefs.getBoolean("ygpu", false)
+        CaptureService.yoloStretch = prefs.getBoolean("ystretch", true)
+        CaptureService.overlay = prefs.getBoolean("ov", false)
 
         // ----- левая колонка: статус и управление -----
         val left = column()
@@ -150,6 +152,13 @@ class MainActivity : Activity() {
         })
         yc.addView(sw("Считать на GPU (быстрее, но не на всех телефонах)", CaptureService.yoloGpu) { c ->
             CaptureService.yoloGpu = c; prefs.edit().putBoolean("ygpu", c).apply()
+        })
+        yc.addView(sw("Растягивать кадр в квадрат (выкл. = с серыми полями)", CaptureService.yoloStretch) { c ->
+            CaptureService.yoloStretch = c; prefs.edit().putBoolean("ystretch", c).apply()
+        })
+        yc.addView(sw("Показывать поверх игры, что видит бот (оверлей)", CaptureService.overlay) { c ->
+            CaptureService.overlay = c; prefs.edit().putBoolean("ov", c).apply()
+            BotService.inst?.setOverlay(c && CaptureService.running)
         })
         tvYolo = label("", 12f, cMuted)
         yc.addView(tvYolo)

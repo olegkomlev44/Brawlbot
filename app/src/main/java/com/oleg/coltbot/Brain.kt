@@ -28,6 +28,7 @@ class Action {
     var mx = 0f; var my = 0f; var ax = 0f; var ay = 0f
     var attack = false; var attackTap = false; var sup = false; var gadget = false
     var enemies = 0; var state = "ROAM"; var hp = -1f; var ammo = -1f; var eHp = -1f
+    var meX = -1f; var meY = -1f     // где бот видит своего персонажа (px кадра), для оверлея
 }
 
 class Brain(private val w: Int, private val h: Int) {
@@ -97,6 +98,11 @@ class Brain(private val w: Int, private val h: Int) {
     private var healing = false; private var evadeUntil = 0L; private var hpMark = -1f; private var hpMarkT = 0L
     private var pathOk = false; private var pdx = 0.0; private var pdy = 0.0; private var lastPath = 0L
     private var gdx = 0.0; private var gdy = 0.0
+    // разведка: клетки 0.5h в мировых координатах (dead-reckoning от старта матча); в какую сторону безопасно (от газа)
+    private val GN = 40
+    private val gVisit = IntArray(GN * GN); private val gBad = BooleanArray(GN * GN)
+    private var exX = 0.0; private var exY = 0.0; private var exHas = false; private var exSince = 0L
+    private var safeX = 0.0; private var safeY = 0.0; private var safeT = 0L
     private var pn = 0; private var pvux = 0.0; private var pvuy = 0.0
 
     // 16 направлений для оценки движения
@@ -111,6 +117,8 @@ class Brain(private val w: Int, private val h: Int) {
         wx = 0.0; wy = 0.0; lastSuper = 0L; lastGadget = 0L; evadeUntil = 0L
         hpMark = -1f; healing = false; escapeUntil = 0L; stuckSince = 0L; prevHp = -1f
         boxSince = 0L; boxIgnoreUntil = 0L
+        java.util.Arrays.fill(gVisit, 0); java.util.Arrays.fill(gBad, false)
+        exHas = false; safeX = 0.0; safeY = 0.0; safeT = 0L
     }
 
     // итог матча: награда -> самонастройка. Победу/место определить не из чего (нужен скрин итогового экрана),
@@ -396,6 +404,46 @@ class Brain(private val w: Int, private val h: Int) {
         return n
     }
 
+    // ---- разведка: что в поле зрения, то «видели» ----
+    private fun markSeen(now: Long) {
+        val c = h * 0.5; val t = ((now - matchStart) / 1000).toInt() + 1
+        val vx = w * 0.40; val vy = h * 0.38
+        val i0 = floor((wx - vx) / c).toInt(); val i1 = floor((wx + vx) / c).toInt()
+        val j0 = floor((wy - vy) / c).toInt(); val j1 = floor((wy + vy) / c).toInt()
+        for (j in j0..j1) for (i in i0..i1) {
+            val ci = i + GN / 2; val cj = j + GN / 2
+            if (ci in 0 until GN && cj in 0 until GN) gVisit[cj * GN + ci] = t
+        }
+    }
+
+    // выбирает клетку, которую давно не видели (и которая в сторону от газа); цель держим до 7 с или пока не дошли
+    private fun explorePick(now: Long): Boolean {
+        val c = h * 0.5
+        if (exHas && now - exSince < 7000 && hypot(exX - wx, exY - wy) > h * 0.30) return true
+        exHas = false
+        val tSec = ((now - matchStart) / 1000).toInt() + 1
+        val ci = floor(wx / c).toInt() + GN / 2; val cj = floor(wy / c).toInt() + GN / 2
+        val sl = hypot(safeX, safeY); val swt = if (now - safeT < 20000) 1.0 else 0.3
+        var best = -1e9; var bx = 0.0; var by = 0.0
+        for (dj in -4..4) for (di in -4..4) {
+            val i = ci + di; val j = cj + dj
+            if (i < 0 || j < 0 || i >= GN || j >= GN) continue
+            val idx = j * GN + i
+            if (gBad[idx]) continue
+            val cx = (i - GN / 2 + 0.5) * c; val cy = (j - GN / 2 + 0.5) * c
+            val dx = cx - wx; val dy = cy - wy; val d = hypot(dx, dy) / h
+            if (d < 0.55) continue
+            val seen = gVisit[idx]
+            val unseen = if (seen == 0) 1.0 else ((tSec - seen).coerceIn(0, 60) / 60.0)
+            var sc = 1.2 * unseen - 0.3 * d + Random.nextDouble() * 0.15
+            if (sl > 0.3) sc += 0.7 * swt * (dx * safeX + dy * safeY) / (d * h * sl)
+            if (sc > best) { best = sc; bx = cx; by = cy }
+        }
+        if (best < -1e8) return false
+        exX = bx; exY = by; exHas = true; exSince = now
+        return true
+    }
+
     // авторазметка для обучения YOLO: размер рамки берём от калиброванной ширины полоски хп (~1 клетка)
     private fun lab(cls: Int, x: Double, y: Double) {
         val bwid = (Layout.BAR_FULL * w * 0.95).toFloat()
@@ -539,6 +587,11 @@ class Brain(private val w: Int, private val h: Int) {
             pBarX = meX; pBarY = yb.toDouble()
             lab(Cls.ME, meX, meY)
         }
+        if (bk < 0) {
+            // полоски нет (например, патроны кончились и шкала не видна) - позицию берём у YOLO
+            val ym = dets
+            if (ym != null) { var bc = 0f; for (d in ym) if (d.cls == Cls.ME && d.conf >= 0.5f && d.conf > bc) { bc = d.conf; meX = d.cx.toDouble(); meY = d.cy.toDouble() } }
+        }
         meXf = meX; meYf = meY
         meBx = (meX / B).toInt().coerceIn(0, bwc - 1); meBy = (meY / B).toInt().coerceIn(0, bhc - 1)
         if (hp < 0f && !matchFinished && matchStart > 0L && lastPlayerSeen > 0L && now - lastPlayerSeen > Layout.MATCH_GAP_MS) finishMatch(now)
@@ -546,12 +599,14 @@ class Brain(private val w: Int, private val h: Int) {
             // (6) новый матч: персонаж долго не был виден (меню/смерть) -> сбрасываем состояние
             if (lastPlayerSeen == 0L || now - lastPlayerSeen > Layout.MATCH_GAP_MS) { if (!matchFinished && matchStart > 0L) finishMatch(now); matchReset(now) }
             lastPlayerSeen = now
+            markSeen(now)
             if (hp < 0.6f) healing = true else if (hp > 0.9f) healing = false
             if (now - hpMarkT > 1500) { if (hpMark >= 0f && hpMark - hp > 0.25f) evadeUntil = now + 2000; hpMark = hp; hpMarkT = now }
         }
         // ---- яд, кубки, кусты, карта ----
         for (i in pc.indices) isFull[i] = pc[i] >= 50
         var pvx = 0.0; var pvy = 0.0; pn = 0
+        var gax = 0.0; var gay = 0.0; var gn = 0
         var csx = 0.0; var csy = 0.0; var cnn = 0
         var bushD = 1e9; var bushX = 0.0; var bushY = 0.0
         for (by in 0 until bhc) for (bx in 0 until bwc) {
@@ -561,6 +616,7 @@ class Brain(private val w: Int, private val h: Int) {
                 if (dd < bushD && dd < h * 0.6) { bushD = dd; bushX = ddx; bushY = ddy } }
             if (isFull[i]) {
                 val dx = meX - (bx * B + B / 2); val dy = meY - (by * B + B / 2)
+                gax += dx; gay += dy; gn++
                 if (hypot(dx, dy) < h * 0.30) { pvx += dx; pvy += dy; pn++ }
             } else if (pc[i] >= 20) {
                 var near = false
@@ -569,6 +625,10 @@ class Brain(private val w: Int, private val h: Int) {
             }
         }
         for (yy in max(0, meBy - 1)..min(bhc - 1, meBy + 1)) for (xx in max(0, meBx - 1)..min(bwc - 1, meBx + 1)) obst[yy * bwc + xx] = false
+        if (gn >= 6) {
+            val gl = hypot(gax, gay)
+            if (gl > 1e-6) { safeX = 0.85 * safeX + 0.15 * gax / gl; safeY = 0.85 * safeY + 0.15 * gay / gl; safeT = now }
+        }
         val pl = hypot(pvx, pvy)
         if (pl > 1e-6) { pvux = pvx / pl; pvuy = pvy / pl } else { pvux = 0.0; pvuy = 0.0 }
         val inBush = bushB[meBy * bwc + meBx]
@@ -590,11 +650,13 @@ class Brain(private val w: Int, private val h: Int) {
         val moved = abs(meX - pMeX) + abs(meY - pMeY)
         pMeX = meX; pMeY = meY
         if (hasSig && lastMx * lastMx + lastMy * lastMy > 0.1f) {
-            var d = 0; for (i in 0 until 64) d += abs(sig[i] - psig[i])
-            if (d < 64 * 4 && moved < 2.0) {
+            var d = 0; var lo = 255; var hi = 0
+            for (i in 0 until 64) { d += abs(sig[i] - psig[i]); lo = min(lo, sig[i]); hi = max(hi, sig[i]) }
+            if (d < 64 * 4 && moved < 2.0 && hi - lo > 30) {
                 if (stuckSince == 0L) stuckSince = now
                 if (now - stuckSince > 700) {
                     escapeUntil = now + 800; escDir = if (Random.nextBoolean()) 1f else -1f; stuckSince = 0; wAng += 1.6 * escDir
+                    if (exHas) { val gi = (floor(exY / (h * 0.5)).toInt() + GN / 2) * GN + floor(exX / (h * 0.5)).toInt() + GN / 2; if (gi in 0 until GN * GN) gBad[gi] = true; exHas = false }
                 }
             } else stuckSince = 0
         }
@@ -608,7 +670,7 @@ class Brain(private val w: Int, private val h: Int) {
         val yd = dets
         if (yd != null) for (d in yd) {
             val rx = d.cx - meX; val ry = d.cy - meY; val dd = hypot(rx, ry)
-            if (d.cls == Cls.ENEMY && nd < N && dd > h * 0.06) {
+            if (d.cls == Cls.ENEMY && nd < N && dd > h * 0.06 && !nearEnemy(nd, rx, ry)) {   // «Enemy» и «enemy» в датасете - один и тот же враг
                 eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d); nd++
             } else if (d.cls == Cls.BOX && dd > h * 0.08 && d.cy > h * 0.12) {
                 yBox = true; nb++
@@ -643,7 +705,8 @@ class Brain(private val w: Int, private val h: Int) {
         // ---- (1) треки: подтверждённые враги (>=3 наблюдений) ----
         updateTracks(now, nd)
         vis.clear()
-        for (t in tracks) if (t.last == now && t.hits >= 3) vis.add(t)
+        val minHits = if (dets != null) 2 else 3
+        for (t in tracks) if (t.last == now && t.hits >= minHits) vis.add(t)
         val ne = vis.size
         var tgt: Track? = null; var bestPr = -1.0
         for (t in vis) {
@@ -676,6 +739,7 @@ class Brain(private val w: Int, private val h: Int) {
 
         val o = out
         o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
+        o.meX = if (hp >= 0f || bk >= 0) meX.toFloat() else -1f; o.meY = meY.toFloat()
         if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
         if (hp >= 0f && prevHp >= 0f && hp < prevHp - 0.05f) taken += (prevHp - hp)
@@ -763,14 +827,20 @@ class Brain(private val w: Int, private val h: Int) {
                 else pickMove(-gry / gd * strafe, grx / gd * strafe, 1.5, 0.0, 0.0, 0.0, 0.0)
             }
             else -> {
-                // идём прямо, пока путь свободен; упёрлись в стену - поворачиваем в более свободную сторону
-                if (now - lastWander > 9000) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
-                var tries = 0
-                while (tries < 6 && freeRun(cos(wAng), sin(wAng), 6) < 4) {
-                    val l = freeRun(cos(wAng + 0.8), sin(wAng + 0.8), 6); val r = freeRun(cos(wAng - 0.8), sin(wAng - 0.8), 6)
-                    wAng += if (l >= r) 0.8 else -0.8; tries++
+                if (explorePick(now)) {
+                    // разведка: идём туда, где давно не были (и от газа), а не бродим случайно
+                    goalToward(exX - wx, exY - wy, now, avoid)
+                    pickMove(gdx, gdy, 2.5, 0.0, 0.0, 0.0, 0.0)
+                } else {
+                    // идём прямо, пока путь свободен; упёрлись в стену - поворачиваем в более свободную сторону
+                    if (now - lastWander > 9000) { wAng = Random.nextDouble() * 2 * PI; lastWander = now }
+                    var tries = 0
+                    while (tries < 6 && freeRun(cos(wAng), sin(wAng), 6) < 4) {
+                        val l = freeRun(cos(wAng + 0.8), sin(wAng + 0.8), 6); val r = freeRun(cos(wAng - 0.8), sin(wAng - 0.8), 6)
+                        wAng += if (l >= r) 0.8 else -0.8; tries++
+                    }
+                    pickMove(cos(wAng), sin(wAng), 2.5, 0.0, 0.0, 0.0, 0.0)
                 }
-                pickMove(cos(wAng), sin(wAng), 2.5, 0.0, 0.0, 0.0, 0.0)
             }
         }
         if (state != "BOX") boxSince = 0L
