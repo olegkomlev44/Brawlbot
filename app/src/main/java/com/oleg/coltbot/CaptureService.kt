@@ -31,8 +31,10 @@ class CaptureService : Service() {
         @Volatile var lastMatch = ""; @Volatile var tunerInfo = ""
         @Volatile var useYolo = false; @Volatile var yoloGpu = false; @Volatile var yoloInfo = ""
         @Volatile var yoloStretch = true; @Volatile var overlay = false
+        @Volatile var yoloRunner: YoloRunner? = null
+        /** Что показать на экране приложения про YOLO (обновляется даже если кадры не идут). */
+        fun yoloStatus(): String { val r = yoloRunner; return if (r != null) r.statusLine() else yoloInfo }
     }
-    private var yolo: Yolo? = null
     private var proj: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -141,21 +143,12 @@ class CaptureService : Service() {
         val brain = Brain(cw, ch)
         val tuner = Tuner(getSharedPreferences("tuner", MODE_PRIVATE))
         brain.tuner = tuner
-        yolo = null; yoloInfo = ""
+        yoloRunner?.close(); yoloRunner = null; yoloInfo = ""
         if (useYolo) {
             val mf = File(filesDir, "yolo.tflite")
             if (!mf.exists()) yoloInfo = "YOLO включена, но модель не загружена"
-            else try {
-                val y = Yolo(mf.absolutePath, yoloGpu, cw, ch, yoloStretch)
-                yolo = y
-                yoloInfo = "YOLO26 / LiteRT (" + y.accel + ") запущена: классов " + y.names.size + ", вход " + y.info.iw + "x" + y.info.ih +
-                    (if (y.info.nchw) " NCHW" else " NHWC") + (if (yoloStretch) ", растяжение" else ", с полями") +
-                    (if (y.err.isNotEmpty()) "; " + y.err else "")
-            } catch (t: Throwable) {
-                yoloInfo = "YOLO не запустилась: " + t.javaClass.simpleName + " " + (t.message ?: "")
-            }
+            else yoloRunner = YoloRunner(mf.absolutePath, yoloGpu, cw, ch, yoloStretch)   // грузится в фоне, старт бота не задерживает
         }
-        var slowFrames = 0
         BotService.inst?.setOverlay(overlay)
         var bmp: Bitmap? = null; var px = IntArray(0)
         var last = 0L; var tick = 0
@@ -173,19 +166,13 @@ class CaptureService : Service() {
                         bmp!!.copyPixelsFromBuffer(p.buffer); img.close()
                         bmp!!.getPixels(px, 0, bw, 0, 0, bw, ch)
                         brain.mode = mode
-                        val yl = yolo
-                        if (yl != null) {
-                            try {
-                                brain.dets = yl.detect(px, bw)
-                                yoloInfo = "YOLO26 / LiteRT (" + yl.accel + "): %.0f мс, объектов %d".format(yl.ms, yl.count)
-                                // слишком медленно (>250 мс на кадр) - толку нет, возвращаемся к цветовым эвристикам
-                                if (yl.ms > 250f) slowFrames++ else slowFrames = 0
-                                if (slowFrames > 30) { yolo = null; brain.dets = null; yoloInfo = "YOLO отключена: слишком медленно (" + yl.accel + ", %.0f мс)".format(yl.ms) }
-                            } catch (t: Throwable) {
-                                brain.dets = null; yolo = null
-                                yoloInfo = "YOLO сбой, работаю на эвристиках: " + t.javaClass.simpleName + " " + (t.message ?: "") +
-                                    " (нужна float32-модель YOLO26 с выходом [1, 4+классы, якоря] или [1,300,6])"
-                            }
+                        val yr = yoloRunner
+                        if (yr != null) {
+                            yr.submit(px, bw)                       // отдали кадр в фон, не ждём
+                            val d = yr.fresh(now, 700)             // берём последний готовый результат, если он не слишком старый
+                            brain.dets = d
+                            brain.detAge = if (d != null) (now - yr.latestAt) / 1000.0 else 0.0
+                            yoloInfo = yr.statusLine()
                         } else brain.dets = null
                         val a = brain.decide(px, bw, now)
                         lastMatch = brain.lastMatch; tunerInfo = tuner.summary()
@@ -239,7 +226,7 @@ class CaptureService : Service() {
         reader?.setOnImageAvailableListener(null, null)
         try { io?.shutdown(); io?.awaitTermination(3, java.util.concurrent.TimeUnit.SECONDS) } catch (_: Exception) {}
         synchronized(logLock) { try { logOut?.flush(); logOut?.close() } catch (_: Exception) {}; logOut = null }
-        yolo?.close(); yolo = null
+        yoloRunner?.close(); yoloRunner = null
         BotService.inst?.setOverlay(false)
         ht?.quitSafely(); vd?.release(); reader?.close(); proj?.stop(); super.onDestroy()
     }

@@ -48,6 +48,7 @@ class BotService : AccessibilityService() {
                             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                         PixelFormat.TRANSLUCENT)
                     if (Build.VERSION.SDK_INT >= 28) lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    v.data = OverlayData().also { it.hud = "оверлей включён, жду кадры от бота..." }
                     wm.addView(v, lp); ovView = v
                 } else if (!on && ovView != null) {
                     wm.removeView(ovView); ovView = null

@@ -3,10 +3,13 @@ package com.oleg.coltbot
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import org.json.JSONObject
+import android.os.SystemClock
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
 import kotlin.math.abs
 import kotlin.math.max
@@ -297,5 +300,75 @@ class Yolo(path: String, wantGpu: Boolean, private val srcW: Int, private val sr
 
     fun close() {
         try { model.close() } catch (_: Throwable) {}
+    }
+}
+
+
+/**
+ * Запускает YOLO в отдельном потоке: бот НИКОГДА не ждёт нейросеть. Модель грузится и считает где-то сбоку,
+ * а цикл управления берёт самый свежий готовый результат (или играет на цветовых эвристиках, если результата нет/он устарел).
+ */
+class YoloRunner(private val path: String, private val gpu: Boolean, private val cw: Int, private val ch: Int, private val stretch: Boolean) {
+    @Volatile var latest: List<Det> = emptyList(); @Volatile var latestAt = 0L
+    @Volatile var runs = 0; @Volatile var ms = 0f; @Volatile var accel = ""; @Volatile var err = ""
+    @Volatile var failed = false; @Volatile var ready = false
+    private var buf = IntArray(0)
+    private var stride = 0
+    private var yolo: Yolo? = null
+    private val busy = AtomicBoolean(false)
+    private val startedAt = SystemClock.elapsedRealtime()
+    private val ex = Executors.newSingleThreadExecutor()
+    @Volatile private var info = ""
+
+    init {
+        ex.execute {
+            try {
+                val y = Yolo(path, gpu, cw, ch, stretch)
+                yolo = y; accel = y.accel; err = y.err
+                info = "классов " + y.names.size + ", вход " + y.info.iw + "x" + y.info.ih + (if (y.info.nchw) " NCHW" else " NHWC") +
+                    (if (stretch) ", растяжение" else ", с полями")
+                ready = true
+            } catch (t: Throwable) {
+                failed = true; err = "не запустилась: " + t.javaClass.simpleName + " " + (t.message ?: "")
+            }
+        }
+    }
+
+    /** Отдать кадр в нейросеть, если она сейчас свободна (иначе кадр пропускается - это нормально). */
+    fun submit(px: IntArray, strideNow: Int) {
+        val y = yolo
+        if (failed || y == null || !ready) return
+        if (!busy.compareAndSet(false, true)) return
+        try {
+            if (buf.size != px.size) buf = IntArray(px.size)
+            System.arraycopy(px, 0, buf, 0, px.size)
+            stride = strideNow
+            ex.execute {
+                try {
+                    val d = y.detect(buf, stride)
+                    latest = ArrayList<Det>(d); latestAt = SystemClock.elapsedRealtime(); ms = y.ms; runs++
+                } catch (t: Throwable) {
+                    failed = true; err = "сбой: " + t.javaClass.simpleName + " " + (t.message ?: "")
+                } finally { busy.set(false) }
+            }
+        } catch (t: Throwable) { busy.set(false) }
+    }
+
+    /** Свежий результат (не старше maxAge мс) или null. */
+    fun fresh(now: Long, maxAge: Long): List<Det>? = if (!failed && runs > 0 && now - latestAt <= maxAge) latest else null
+
+    fun statusLine(): String {
+        val t = (SystemClock.elapsedRealtime() - startedAt) / 1000
+        if (failed) return "YOLO: " + err + " (бот играет на эвристиках; нужна float32-модель YOLO26 с выходом [1,4+классы,якоря] или [1,300,6])"
+        if (!ready) return "YOLO: загружаю модель... " + t + " с"
+        if (runs == 0) return "YOLO: модель загружена (" + accel + ", " + info + "), жду первого результата... " + t + " с"
+        val slow = if (ms > 450f) " - медленно, результат часто устаревает: попробуй GPU" else ""
+        return "YOLO26 / LiteRT (" + accel + "): %.0f мс на кадр, объектов %d, запусков %d%s".format(ms, latest.size, runs, slow) +
+            (if (err.isNotEmpty()) "; " + err else "") + "\n(" + info + ")"
+    }
+
+    fun close() {
+        ex.shutdownNow()
+        try { yolo?.close() } catch (_: Throwable) {}
     }
 }

@@ -37,6 +37,8 @@ class Brain(private val w: Int, private val h: Int) {
     var mode = Mode.SHOWDOWN
     /** Свежие детекции YOLO26 (LiteRT). null = детектор выключен: работают только цветовые эвристики. */
     var dets: List<Det>? = null
+    /** Возраст детекций YOLO в секундах: нейросеть считает в фоне, пока я двигаюсь - сдвигаем найденное обратно. */
+    var detAge = 0.0
     /** Что нашли цветовые эвристики на этом кадре - автоматическая (грубая) разметка для обучения YOLO. */
     val hDets = ArrayList<Det>()
 
@@ -468,12 +470,12 @@ class Brain(private val w: Int, private val h: Int) {
     }
 
     // хп врага, найденного YOLO: красная полоска прямо над ним; нет полоски - считаем полным
-    private fun barHpNear(d: Det): Double {
+    private fun barHpNear(d: Det, cxd: Double, cyd: Double): Double {
         for (i in 0 until nc) {
             val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
             if (sn[i] < 20 || wd < w * 0.023 || wd < 2.5 * ht || ht > 9) continue
             val cxb = (x0[i] + x1[i]) / 2.0
-            if (abs(cxb - d.cx) < d.bw * 0.7 + 4 && y0[i] < d.cy && y0[i] > d.cy - d.bh * 1.2 - 8)
+            if (abs(cxb - cxd) < d.bw * 0.7 + 4 && y0[i] < cyd && y0[i] > cyd - d.bh * 1.2 - 8)
                 return (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0)
         }
         return 1.0
@@ -590,7 +592,7 @@ class Brain(private val w: Int, private val h: Int) {
         if (bk < 0) {
             // полоски нет (например, патроны кончились и шкала не видна) - позицию берём у YOLO
             val ym = dets
-            if (ym != null) { var bc = 0f; for (d in ym) if (d.cls == Cls.ME && d.conf >= 0.5f && d.conf > bc) { bc = d.conf; meX = d.cx.toDouble(); meY = d.cy.toDouble() } }
+            if (ym != null) { var bc = 0f; for (d in ym) if (d.cls == Cls.ME && d.conf >= 0.5f && d.conf > bc) { bc = d.conf; meX = d.cx.toDouble(); meY = d.cy.toDouble() } }   // «я» всегда около центра экрана, сдвиг не нужен
         }
         meXf = meX; meYf = meY
         meBx = (meX / B).toInt().coerceIn(0, bwc - 1); meBy = (meY / B).toInt().coerceIn(0, bhc - 1)
@@ -635,9 +637,11 @@ class Brain(private val w: Int, private val h: Int) {
         // кубок: если YOLO его видит - берём ближайший, иначе старый цветовой поиск по блокам
         var yCube = false; var ycx = 0.0; var ycy = 0.0; var ycd = 1e9
         val yd0 = dets
+        // пока считалась нейросеть, я шёл (lastMx,lastMy): камера ехала за мной, всё найденное сдвинулось на экране обратно
+        val shX = lastMx * Layout.PLAYER_SPEED * h * detAge; val shY = lastMy * Layout.PLAYER_SPEED * h * detAge
         if (yd0 != null) for (d in yd0) if (d.cls == Cls.CUBE) {
-            val dd = hypot(d.cx - meX, d.cy - meY)
-            if (dd < ycd && dd > h * 0.03) { ycd = dd; ycx = d.cx.toDouble(); ycy = d.cy.toDouble(); yCube = true }
+            val dd = hypot(d.cx - shX - meX, d.cy - shY - meY)
+            if (dd < ycd && dd > h * 0.03) { ycd = dd; ycx = d.cx - shX; ycy = d.cy - shY; yCube = true }
         }
         val cubeOk = yCube || cnn in 1..8
         val dsx = if (yCube) ycx else if (cubeOk) csx / cnn else 0.0
@@ -669,9 +673,9 @@ class Brain(private val w: Int, private val h: Int) {
         var yBox = false
         val yd = dets
         if (yd != null) for (d in yd) {
-            val rx = d.cx - meX; val ry = d.cy - meY; val dd = hypot(rx, ry)
+            val rx = d.cx - shX - meX; val ry = d.cy - shY - meY; val dd = hypot(rx, ry)
             if (d.cls == Cls.ENEMY && nd < N && dd > h * 0.06 && !nearEnemy(nd, rx, ry)) {   // «Enemy» и «enemy» в датасете - один и тот же враг
-                eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d); nd++
+                eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d, meX + rx, meY + ry); nd++
             } else if (d.cls == Cls.BOX && dd > h * 0.08 && d.cy > h * 0.12) {
                 yBox = true; nb++
                 if (dd < boxD) { boxD = dd; boxX = rx; boxY = ry }

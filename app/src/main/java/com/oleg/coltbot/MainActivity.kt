@@ -244,8 +244,8 @@ class MainActivity : Activity() {
             (if (CaptureService.tunerInfo.isNotEmpty()) "\nСамонастройка: ${CaptureService.tunerInfo}" else "")
         val mf = File(filesDir, "yolo.tflite")
         tvYolo.text = (if (mf.exists()) "Модель: " + "%.1f".format(mf.length() / 1048576.0) + " МБ" else "Модель не загружена") +
-            (if (CaptureService.yoloInfo.isNotEmpty()) "\n" + CaptureService.yoloInfo else "") +
-            "\nБез модели (или если YOLO не запустилась) бот играет по цветовым эвристикам, как раньше. Настройки применяются при следующем старте."
+            (if (CaptureService.yoloStatus().isNotEmpty()) "\n" + CaptureService.yoloStatus() else "") +
+            "\nБез модели или пока YOLO не отвечает бот играет по цветовым эвристикам. Настройки применяются при следующем старте." + (if (BotService.lastErr.isNotEmpty()) "\nСлужба: " + BotService.lastErr else "")
         tvFrames.text = "Сохранено кадров: ${CaptureService.framesSaved}"
         tvPath.text = "Папка: " + (CaptureService.recDir.ifEmpty { "Загрузки/Brawlbot/ (появится при записи)" })
     }
