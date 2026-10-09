@@ -309,7 +309,7 @@ class Yolo(path: String, wantGpu: Boolean, private val srcW: Int, private val sr
  * а цикл управления берёт самый свежий готовый результат (или играет на цветовых эвристиках, если результата нет/он устарел).
  */
 class YoloRunner(private val path: String, private val gpu: Boolean, private val cw: Int, private val ch: Int, private val stretch: Boolean) {
-    @Volatile var latest: List<Det> = emptyList(); @Volatile var latestAt = 0L
+    @Volatile var latest: List<Det> = emptyList(); @Volatile var latestAt = 0L; @Volatile var latestObs = 0L
     @Volatile var runs = 0; @Volatile var ms = 0f; @Volatile var accel = ""; @Volatile var err = ""
     @Volatile var failed = false; @Volatile var ready = false
     private var buf = IntArray(0)
@@ -343,10 +343,11 @@ class YoloRunner(private val path: String, private val gpu: Boolean, private val
             if (buf.size != px.size) buf = IntArray(px.size)
             System.arraycopy(px, 0, buf, 0, px.size)
             stride = strideNow
+            val tObs = SystemClock.elapsedRealtime()      // момент кадра: именно к нему относится результат, а не ко времени окончания расчёта
             ex.execute {
                 try {
                     val d = y.detect(buf, stride)
-                    latest = ArrayList<Det>(d); latestAt = SystemClock.elapsedRealtime(); ms = y.ms; runs++
+                    latest = ArrayList<Det>(d); latestAt = SystemClock.elapsedRealtime(); latestObs = tObs; ms = y.ms; runs++
                 } catch (t: Throwable) {
                     failed = true; err = "сбой: " + t.javaClass.simpleName + " " + (t.message ?: "")
                 } finally { busy.set(false) }
@@ -355,7 +356,7 @@ class YoloRunner(private val path: String, private val gpu: Boolean, private val
     }
 
     /** Свежий результат (не старше maxAge мс) или null. */
-    fun fresh(now: Long, maxAge: Long): List<Det>? = if (!failed && runs > 0 && now - latestAt <= maxAge) latest else null
+    fun fresh(now: Long, maxAge: Long): List<Det>? = if (!failed && runs > 0 && now - latestObs <= maxAge) latest else null
 
     fun statusLine(): String {
         val t = (SystemClock.elapsedRealtime() - startedAt) / 1000

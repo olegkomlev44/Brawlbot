@@ -29,6 +29,7 @@ class Action {
     var attack = false; var attackTap = false; var sup = false; var gadget = false
     var enemies = 0; var state = "ROAM"; var hp = -1f; var ammo = -1f; var eHp = -1f
     var meX = -1f; var meY = -1f     // где бот видит своего персонажа (px кадра), для оверлея
+    var why = ""                      // почему стреляет / не стреляет (для оверлея и лога)
 }
 
 class Brain(private val w: Int, private val h: Int) {
@@ -39,6 +40,11 @@ class Brain(private val w: Int, private val h: Int) {
     var dets: List<Det>? = null
     /** Возраст детекций YOLO в секундах: нейросеть считает в фоне, пока я двигаюсь - сдвигаем найденное обратно. */
     var detAge = 0.0
+    /** Номер результата YOLO: один и тот же результат нельзя засчитывать как новое наблюдение (скорость врага схлопнется в ноль). */
+    var detSeq = 0
+    private var lastSeq = -1
+    private var holdUntil = 0L; private var holdNext = 0L
+    private var curState = "ROAM"; private var stateSince = 0L
     /** Что нашли цветовые эвристики на этом кадре - автоматическая (грубая) разметка для обучения YOLO. */
     val hDets = ArrayList<Det>()
 
@@ -50,6 +56,7 @@ class Brain(private val w: Int, private val h: Int) {
         var vx = 0.0; var vy = 0.0    // мировая скорость, px/с (сглаженная)
         var hp = 1.0; var hits = 0
         var first = 0L; var last = 0L; var stamp = 0L
+        var obsT = 0L                 // когда было последнее НАСТОЯЩЕЕ наблюдение (время кадра, а не время расчёта)
         var cons = 0.5                // 0..1: насколько предсказуемо движется (для упреждения)
     }
     private val tracks = ArrayList<Track>()
@@ -121,6 +128,7 @@ class Brain(private val w: Int, private val h: Int) {
         boxSince = 0L; boxIgnoreUntil = 0L
         java.util.Arrays.fill(gVisit, 0); java.util.Arrays.fill(gBad, false)
         exHas = false; safeX = 0.0; safeY = 0.0; safeT = 0L
+        curState = "ROAM"; stateSince = 0L; holdUntil = 0L; lastSeq = -1
     }
 
     // итог матча: награда -> самонастройка. Победу/место определить не из чего (нужен скрин итогового экрана),
@@ -475,20 +483,21 @@ class Brain(private val w: Int, private val h: Int) {
             val wd = x1[i] - x0[i] + 1; val ht = y1[i] - y0[i] + 1
             if (sn[i] < 20 || wd < w * 0.023 || wd < 2.5 * ht || ht > 9) continue
             val cxb = (x0[i] + x1[i]) / 2.0
-            if (abs(cxb - cxd) < d.bw * 0.7 + 4 && y0[i] < cyd && y0[i] > cyd - d.bh * 1.2 - 8)
+            if (abs(cxb - cxd) < d.bw * 0.9 + h * 0.05 && y0[i] < cyd + h * 0.03 && y0[i] > cyd - d.bh * 1.2 - h * 0.06)
                 return (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0)
         }
-        return 1.0
+        return -1.0
     }
 
     // привязка детекций к трекам: постоянные id, своя скорость у каждого врага
-    private fun updateTracks(now: Long, nd: Int) {
+    private fun updateTracks(now: Long, nd: Int, obsMs: Long) {
+        val ag = ((now - obsMs) / 1000.0).coerceIn(0.0, 0.6)     // насколько наблюдение старше текущего момента
         for (i in 0 until nd) {
             val nx = wx + eX[i]; val ny = wy + eY[i]
             var best: Track? = null; var bestD = 1e18
             for (t in tracks) {
                 if (t.stamp == now) continue
-                val dtt = ((now - t.last) / 1000.0).coerceAtMost(0.6)
+                val dtt = ((obsMs - t.obsT) / 1000.0).coerceIn(0.0, 0.6)
                 val gate = h * 0.12 + Layout.PLAYER_SPEED * h * dtt
                 val d = hypot(nx - (t.x + t.vx * dtt), ny - (t.y + t.vy * dtt))
                 if (d < gate && d < bestD) { bestD = d; best = t }
@@ -496,12 +505,12 @@ class Brain(private val w: Int, private val h: Int) {
             if (best == null) {
                 if (tracks.size >= 12) continue
                 val t = Track(); t.id = nextId++
-                t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = eH[i]
-                t.hits = 1; t.first = now; t.last = now; t.stamp = now
+                t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = if (eH[i] < 0) 1.0 else eH[i]
+                t.hits = 1; t.first = now; t.last = now; t.stamp = now; t.obsT = obsMs
                 tracks.add(t)
             } else {
                 val t: Track = best
-                val dtt = (now - t.last) / 1000.0
+                val dtt = (obsMs - t.obsT) / 1000.0
                 if (dtt > 0.6) { t.vx = 0.0; t.vy = 0.0; t.cons = 0.3 }
                 else if (dtt > 0.02) {
                     var mvx = (nx - t.x) / dtt; var mvy = (ny - t.y) / dtt
@@ -518,11 +527,20 @@ class Brain(private val w: Int, private val h: Int) {
                     // быстрое сглаживание: при 10-11 к/с alpha 0.45 даёт ~0.25 c лага в оценке скорости
                     t.vx += 0.70 * (mvx - t.vx); t.vy += 0.70 * (mvy - t.vy)
                 }
-                val drop = t.hp - eH[i]   // у врага просела полоска хп сразу после нашего выстрела - засчитываем урон
+                val nh = if (eH[i] < 0) t.hp else eH[i]       // полоски хп не нашли - оставляем прежнее значение
+                val drop = t.hp - nh   // у врага просела полоска хп сразу после нашего выстрела - засчитываем урон
                 if (drop > 0.04 && drop < 0.7 && now - lastAttackAt < 800) dealt += drop
-                t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = eH[i]
+                t.x = nx; t.y = ny; t.hp = nh; t.obsT = obsMs
                 t.hits++; t.last = now; t.stamp = now
             }
+        }
+        // положение «сейчас» = наблюдение + скорость * возраст (YOLO считает в фоне, результат бывает на 100-400 мс старше)
+        for (t in tracks) if (t.stamp == now) { t.rx = t.x + t.vx * ag - wx; t.ry = t.y + t.vy * ag - wy }
+        // враг не попал в свежий результат (моргнула детекция) - ещё ~0.45 с ведём его по скорости, чтобы не дёргать тактику
+        for (t in tracks) {
+            if (t.stamp == now || t.hits < 2) continue
+            val a2 = (now - t.obsT) / 1000.0
+            if (a2 in 0.0..0.45) { t.rx = t.x + t.vx * a2 - wx; t.ry = t.y + t.vy * a2 - wy; t.last = now; t.stamp = now }
         }
         var tk = tracks.size - 1
         while (tk >= 0) {
@@ -672,9 +690,10 @@ class Brain(private val w: Int, private val h: Int) {
         // YOLO: враги и ящики по самому телу (центр точный, не зависит от цвета полоски хп)
         var yBox = false
         val yd = dets
+        val yFresh = yd != null && detSeq != lastSeq          // новый результат нейросети (а не повтор прошлого)
         if (yd != null) for (d in yd) {
             val rx = d.cx - shX - meX; val ry = d.cy - shY - meY; val dd = hypot(rx, ry)
-            if (d.cls == Cls.ENEMY && nd < N && dd > h * 0.06 && !nearEnemy(nd, rx, ry)) {   // «Enemy» и «enemy» в датасете - один и тот же враг
+            if (d.cls == Cls.ENEMY && yFresh && nd < N && dd > h * 0.06 && !nearEnemy(nd, rx, ry)) {   // «Enemy» и «enemy» в датасете - один и тот же враг
                 eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d, meX + rx, meY + ry); nd++
             } else if (d.cls == Cls.BOX && dd > h * 0.08 && d.cy > h * 0.12) {
                 yBox = true; nb++
@@ -696,7 +715,7 @@ class Brain(private val w: Int, private val h: Int) {
             val d = hypot(rx, ry)
             if (pink >= 6) {
                 lab(Cls.ENEMY, meX + rx, meY + ry)
-                if (nd < N && !nearEnemy(nd, rx, ry)) { eX[nd] = rx; eY[nd] = ry; eH[nd] = (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0); nd++ }
+                if (nd < N && yd == null && !nearEnemy(nd, rx, ry)) { eX[nd] = rx; eY[nd] = ry; eH[nd] = (wd / (Layout.BAR_FULL * w * 0.95)).coerceAtMost(1.0); nd++ }   // с YOLO враги только от неё
             } else {
                 // ящик: тонкая полоска хп, не у самого себя, не в декоре сверху (тыквы/надгробия), полоска не толстая
                 if (d < h * 0.10 || y0[i] < h * 0.19 || ht > max(6.0, h * 0.025)) continue
@@ -707,7 +726,8 @@ class Brain(private val w: Int, private val h: Int) {
 
         if (now < boxIgnoreUntil) nb = 0
         // ---- (1) треки: подтверждённые враги (>=3 наблюдений) ----
-        updateTracks(now, nd)
+        updateTracks(now, nd, if (yd != null) now - (detAge * 1000).toLong() else now)
+        if (yd != null) lastSeq = detSeq
         vis.clear()
         val minHits = if (dets != null) 2 else 3
         for (t in tracks) if (t.last == now && t.hits >= minHits) vis.add(t)
@@ -742,7 +762,7 @@ class Brain(private val w: Int, private val h: Int) {
         }
 
         val o = out
-        o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
+        o.why = ""; o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
         o.meX = if (hp >= 0f || bk >= 0) meX.toFloat() else -1f; o.meY = meY.toFloat()
         if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
@@ -772,7 +792,7 @@ class Brain(private val w: Int, private val h: Int) {
         // в начале шоудауна сначала лутаем кубки/ящики, а с врагами не лезем в драку
         val lootFirst = mode == Mode.SHOWDOWN && aggr < 0.45 && (dn > 0 || nb > 0) && (ne == 0 || (dist > 0.30f && now >= evadeUntil))
         val dropFirst = dn > 0 && (ne == 0 || dist > 0.25f)
-        val state = when {
+        val cand = when {
             pn >= 3 -> "POISON"
             pinch -> "PINCH"
             ne > 0 && now >= standUntil && (low || ne >= 3 || now < evadeUntil) -> "EVADE"
@@ -785,6 +805,18 @@ class Brain(private val w: Int, private val h: Int) {
             nb > 0 -> "BOX"
             else -> "ROAM"
         }
+        // гистерезис: выбранное поведение держим минимум 1-2 с, если оно ещё применимо (иначе бот метался между ящиком, дракой и разведкой каждый кадр)
+        val stillOk = when (curState) {
+            "ATTACK", "EVADE" -> ne > 0
+            "BOX" -> nb > 0
+            "DROP" -> dn > 0
+            "HIDE" -> healing && ne == 0 && bushD < 1e8
+            else -> false
+        }
+        val holdMs = when (curState) { "ATTACK" -> 1200L; "EVADE" -> 1500L; "BOX" -> 1500L; "DROP" -> 1200L; "HIDE" -> 2000L; else -> 0L }
+        val urgent = cand == "POISON" || cand == "PINCH" || cand == "EVADE"
+        val state = if (!urgent && cand != curState && stillOk && now - stateSince < holdMs) curState else cand
+        if (state != curState) { curState = state; stateSince = now }
         o.state = state
 
         val engage = ammo < 0f || nHp < 0f || nHp <= ammo * 3 * Layout.SLOT_DMG * 1.3f + 0.1f
@@ -823,7 +855,11 @@ class Brain(private val w: Int, private val h: Int) {
                 val hold = tgt != null && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
                         los(tgt.rx, tgt.ry) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
                 pickMove(gdx, gdy, wg, band, 3.0, (if (hold) 0.15 else 0.6) * prm.strafeMul, if (reload || !engage) 1.8 else 0.2)
-                if (hold && Random.nextFloat() < prm.holdProb) moving = false
+                // «постоять и прицелиться» - окнами по ~0.4 с, а не случайным дёрганием джойстика каждый кадр
+                if (hold) {
+                    if (now < holdUntil) moving = false
+                    else if (now >= holdNext) { holdNext = now + 450; if (Random.nextFloat() < prm.holdProb) holdUntil = now + 400 }
+                } else holdUntil = 0L
             }
             "GHOST" -> {
                 val gd = hypot(grx, gry).coerceAtLeast(1.0)
@@ -860,12 +896,20 @@ class Brain(private val w: Int, private val h: Int) {
             val slots = if (ammo >= 0f) (ammo * 3f).toInt() else 3
             val killable = tgt.hp <= slots * Layout.SLOT_DMG + 0.05
             // стреляем только при полном слоте; на дальней дистанции держим один слот в запасе (если не добиваем)
-            var ok = sight && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
-            if (ok && dist > Layout.TOO_FAR && ammo in 0f..0.66f && !killable) ok = false
+            // карта стен строится по цветам и иногда ошибается: если давно не стреляли, а враг рядом - проверяем выстрелом
+            val forceFire = !sight && dist < 0.5f && now - lastAttackAt > 1800 && (ammo < 0f || ammo >= 0.6f)
+            var ok = (sight || forceFire) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
+            var why = if (!sight && !forceFire) "нет линии огня" else if (!ok) "перезарядка" else ""
+            if (ok && dist > Layout.TOO_FAR && ammo in 0f..0.66f && !killable) { ok = false; why = "берегу патрон" }
+            // тап = встроенное автонаведение игры: бьёт в ближайшего врага без нашей математики и задержек.
+            // свайп с упреждением нужен только для дальних/быстрых целей или когда ближе есть другая цель
+            var nearest = true
+            for (u in vis) if (u !== tgt && hypot(u.rx, u.ry) < dist * h * 0.85) nearest = false
             if (state != "PINCH") {
                 o.attack = ok
-                // в упор свайп-прицел ненадёжен: игра сама наведётся точнее по тапу
-                if (ok && sight && dist < 0.33f) o.attackTap = true
+                if (ok && nearest && dist < 0.46f) o.attackTap = true
+                if (ok) why = if (o.attackTap) "огонь (тап)" else "огонь (прицел)"
+                o.why = why
                 // супер: сколько врагов лежит на линии выстрела
                 var value = 0
                 for (u in vis) {
@@ -896,16 +940,18 @@ class Brain(private val w: Int, private val h: Int) {
         } else if (state == "GHOST" && hypot(grx, gry) < h * Layout.SHOOT && now - lastGhostShot > 700 && (ammo < 0f || ammo > 0.5f)) {
             val l = hypot(grx, gry).coerceAtLeast(1.0)
             o.ax = (grx / l).toFloat(); o.ay = (gry / l).toFloat(); o.attack = true; lastGhostShot = now
-        } else if (state == "BOX" && boxD < h * Layout.SHOOT && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
+        } else if (state == "BOX" && boxD < h * 0.55 && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)) {
             o.ax = (boxX / boxD).toFloat(); o.ay = (boxY / boxD).toFloat()
             // стреляем только если между нами нет стены (иначе пули уходят в блок и ящик не ломается)
             if (los(boxX, boxY)) {
                 o.attack = true
                 // ящик близко - тап: авто-наведение игры попадает надёжнее свайпа
-                if (boxD < h * 0.42f) o.attackTap = true
+                o.attackTap = true
+                o.why = "ящик (тап)"
             }
         }
         if (o.attack) { lastAttackAt = now; shots++ }
+        if (!o.attack && o.why.isEmpty()) o.why = if (ne == 0) "нет цели" else "далеко"
         return o
     }
 }

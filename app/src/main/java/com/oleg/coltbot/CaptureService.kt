@@ -169,9 +169,10 @@ class CaptureService : Service() {
                         val yr = yoloRunner
                         if (yr != null) {
                             yr.submit(px, bw)                       // отдали кадр в фон, не ждём
-                            val d = yr.fresh(now, 700)             // берём последний готовый результат, если он не слишком старый
+                            val d = yr.fresh(now, 900)             // берём последний готовый результат, если он не слишком старый
                             brain.dets = d
-                            brain.detAge = if (d != null) (now - yr.latestAt) / 1000.0 else 0.0
+                            brain.detAge = if (d != null) (now - yr.latestObs) / 1000.0 else 0.0
+                            brain.detSeq = yr.runs
                             yoloInfo = yr.statusLine()
                         } else brain.dets = null
                         val a = brain.decide(px, bw, now)
@@ -186,7 +187,7 @@ class CaptureService : Service() {
                             od.heur = ArrayList<Det>(brain.hDets)
                             od.meX = a.meX; od.meY = a.meY
                             od.mx = a.mx; od.my = a.my; od.ax = a.ax; od.ay = a.ay; od.attack = a.attack
-                            od.hud = a.state + "  хп " + (if (a.hp >= 0f) "" + (a.hp * 100).toInt() + "%" else "?") +
+                            od.hud = a.state + " | " + a.why + "  хп " + (if (a.hp >= 0f) "" + (a.hp * 100).toInt() + "%" else "?") +
                                 "  патр " + (if (a.ammo >= 0f) "%.1f".format(a.ammo * 3) else "?") + "  врагов " + a.enemies + "\n" +
                                 (if (yoloInfo.isNotEmpty()) yoloInfo else "YOLO выключена: только цветовые эвристики") + "\n" +
                                 "жесты " + BotService.sent + "/" + BotService.done + "  отмен " + BotService.cancelled
@@ -197,7 +198,7 @@ class CaptureService : Service() {
                             // ширина буфера бывает больше кадра (выравнивание строк): режем до реальной ширины, иначе разметка поедет
                             val copy = if (bw == cw) bmp!!.copy(Bitmap.Config.ARGB_8888, false) else Bitmap.createBitmap(bmp!!, 0, 0, cw, ch)
                             val name = "f$tick.jpg"; val lname = "f$tick.txt"; val lbl = brain.labelText()
-                            val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo}}""" + "\n"
+                            val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo},"why":"${a.why}"}""" + "\n"
                             io?.execute { // запись на диск в отдельном потоке
                                 try {
                                     saveFrame(name, copy)
