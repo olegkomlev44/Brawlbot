@@ -30,6 +30,7 @@ class Action {
     var enemies = 0; var state = "ROAM"; var hp = -1f; var ammo = -1f; var eHp = -1f
     var meX = -1f; var meY = -1f     // где бот видит своего персонажа (px кадра), для оверлея
     var why = ""                      // почему стреляет / не стреляет (для оверлея и лога)
+    var tinfo = ""                    // кто цель и как с ним играем (для оверлея и лога)
 }
 
 class Brain(private val w: Int, private val h: Int) {
@@ -57,6 +58,7 @@ class Brain(private val w: Int, private val h: Int) {
         var hp = 1.0; var hits = 0
         var first = 0L; var last = 0L; var stamp = 0L
         var obsT = 0L                 // когда было последнее НАСТОЯЩЕЕ наблюдение (время кадра, а не время расчёта)
+        var bi: BInfo? = null         // какой это бравлер (по названию класса YOLO), null = не знаем
         var cons = 0.5                // 0..1: насколько предсказуемо движется (для упреждения)
     }
     private val tracks = ArrayList<Track>()
@@ -70,6 +72,8 @@ class Brain(private val w: Int, private val h: Int) {
     private val x0 = DoubleArray(N); private val x1 = DoubleArray(N); private val y0 = DoubleArray(N); private val y1 = DoubleArray(N)
     private var nc = 0
     private val eX = DoubleArray(N); private val eY = DoubleArray(N); private val eH = DoubleArray(N)
+    private val eT = arrayOfNulls<BInfo>(N)
+    private var tgId = 0
 
     private var lastSuper = 0L; private var lastGadget = 0L; private var lastFlip = 0L; private var flipEvery = 1200L
     private var strafe = 1f; private var lastWander = 0L; private var wAng = 0.0
@@ -128,7 +132,7 @@ class Brain(private val w: Int, private val h: Int) {
         boxSince = 0L; boxIgnoreUntil = 0L
         java.util.Arrays.fill(gVisit, 0); java.util.Arrays.fill(gBad, false)
         exHas = false; safeX = 0.0; safeY = 0.0; safeT = 0L
-        curState = "ROAM"; stateSince = 0L; holdUntil = 0L; lastSeq = -1
+        curState = "ROAM"; stateSince = 0L; holdUntil = 0L; lastSeq = -1; tgId = 0
     }
 
     // итог матча: награда -> самонастройка. Победу/место определить не из чего (нужен скрин итогового экрана),
@@ -506,7 +510,7 @@ class Brain(private val w: Int, private val h: Int) {
                 if (tracks.size >= 12) continue
                 val t = Track(); t.id = nextId++
                 t.x = nx; t.y = ny; t.rx = eX[i]; t.ry = eY[i]; t.hp = if (eH[i] < 0) 1.0 else eH[i]
-                t.hits = 1; t.first = now; t.last = now; t.stamp = now; t.obsT = obsMs
+                t.hits = 1; t.first = now; t.last = now; t.stamp = now; t.obsT = obsMs; t.bi = eT[i]
                 tracks.add(t)
             } else {
                 val t: Track = best
@@ -531,6 +535,7 @@ class Brain(private val w: Int, private val h: Int) {
                 val drop = t.hp - nh   // у врага просела полоска хп сразу после нашего выстрела - засчитываем урон
                 if (drop > 0.04 && drop < 0.7 && now - lastAttackAt < 800) dealt += drop
                 t.x = nx; t.y = ny; t.hp = nh; t.obsT = obsMs
+                val tp = eT[i]; if (tp != null) t.bi = tp
                 t.hits++; t.last = now; t.stamp = now
             }
         }
@@ -691,10 +696,22 @@ class Brain(private val w: Int, private val h: Int) {
         var yBox = false
         val yd = dets
         val yFresh = yd != null && detSeq != lastSeq          // новый результат нейросети (а не повтор прошлого)
+        java.util.Arrays.fill(eT, null)
         if (yd != null) for (d in yd) {
             val rx = d.cx - shX - meX; val ry = d.cy - shY - meY; val dd = hypot(rx, ry)
             if (d.cls == Cls.ENEMY && yFresh && nd < N && dd > h * 0.06 && !nearEnemy(nd, rx, ry)) {   // «Enemy» и «enemy» в датасете - один и тот же враг
                 eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d, meX + rx, meY + ry); nd++
+            } else if (d.cls < 0 && yFresh && d.conf >= 0.5f && dd > h * 0.07 && Brawlers.get(d.name) != null) {
+                // класс-название бравлера (shelly, piper...): уточняет уже найденного врага, а в соло-шоудауне сам считается врагом
+                val bi = Brawlers.get(d.name)
+                var k = -1
+                for (j in 0 until nd) if (hypot(eX[j] - rx, eY[j] - ry) < h * 0.09) { k = j; break }
+                if (k >= 0) eT[k] = bi
+                else if (mode == Mode.SHOWDOWN && nd < N) {
+                    var ally = false
+                    for (a in yd) if (a.cls == Cls.ALLY && hypot(a.cx - shX - meX - rx, a.cy - shY - meY - ry) < h * 0.09) ally = true
+                    if (!ally) { eX[nd] = rx; eY[nd] = ry; eH[nd] = barHpNear(d, meX + rx, meY + ry); eT[nd] = bi; nd++ }
+                }
             } else if (d.cls == Cls.BOX && dd > h * 0.08 && d.cy > h * 0.12) {
                 yBox = true; nb++
                 if (dd < boxD) { boxD = dd; boxX = rx; boxY = ry }
@@ -735,10 +752,18 @@ class Brain(private val w: Int, private val h: Int) {
         var tgt: Track? = null; var bestPr = -1.0
         for (t in vis) {
             val d = hypot(t.rx, t.ry)
-            val pr = (1.05 - t.hp) / (d / h + 0.1) * (if (los(t.rx, t.ry)) 1.0 else 0.55)
+            var pr = (1.05 - t.hp) / (d / h + 0.1) * (if (los(t.rx, t.ry)) 1.0 else 0.55)
+            val tbi = t.bi
+            if (tbi != null) {
+                // хрупкого убиваем быстрее (приоритет выше), у танка запас хп большой - он менее выгодная цель
+                val kill = 3.0 / Brawlers.slotsToKill(tbi, t.hp)
+                pr *= (0.75 + min(1.0, kill) * 0.5) * (0.9 + 0.2 * tbi.burst)
+            }
+            if (t.id == tgId) pr *= 1.35        // не прыгаем между целями
             if (pr > bestPr) { bestPr = pr; tgt = t }
         }
         tg = tgt
+        tgId = tgt?.id ?: 0
         val bd = if (tgt != null) hypot(tgt.rx, tgt.ry) else 1e9
         val nHp = if (tgt != null) tgt.hp.toFloat() else -1f
         val ux = if (tgt != null) tgt.rx / bd else 0.0; val uy = if (tgt != null) tgt.ry / bd else 0.0
@@ -762,7 +787,7 @@ class Brain(private val w: Int, private val h: Int) {
         }
 
         val o = out
-        o.why = ""; o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
+        o.tinfo = ""; o.why = ""; o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
         o.meX = if (hp >= 0f || bk >= 0) meX.toFloat() else -1f; o.meY = meY.toFloat()
         if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
@@ -788,6 +813,8 @@ class Brain(private val w: Int, private val h: Int) {
         var aggr = if (mode == Mode.SHOWDOWN) (if (phase < 40) 0.30 else if (phase < 100) 0.60 else 0.80) else 0.80
         if (hp >= 0f) aggr *= (0.5 + 0.5 * hp)
         if (ne >= 2) aggr *= 0.7
+        val tb0 = tgt?.bi
+        if (tb0 != null) aggr *= (1.1 - 0.25 * tb0.burst)       // против «дробовиков» осторожнее
         aggr = (aggr * prm.aggrMul).coerceIn(0.1, 1.0)
         // в начале шоудауна сначала лутаем кубки/ящики, а с врагами не лезем в драку
         val lootFirst = mode == Mode.SHOWDOWN && aggr < 0.45 && (dn > 0 || nb > 0) && (ne == 0 || (dist > 0.30f && now >= evadeUntil))
@@ -841,11 +868,26 @@ class Brain(private val w: Int, private val h: Int) {
                 else moving = false
             }
             "ATTACK" -> {
-                val band = when {
+                var band = when {
                     now < standUntil -> max(0.25, min(dist.toDouble(), 0.50))   // не бежим от того, от кого не убежать
                     !engage -> 0.62
                     reload -> 0.60
                     else -> prm.bandBase + 0.14 * (1.0 - aggr)
+                }
+                // дистанция и стрейф зависят от того, КТО перед нами
+                var strafeK = 1.0
+                val tb = tgt?.bi
+                if (tb != null && engage && !reload && now >= standUntil) {
+                    val rEn = Brawlers.rangeH(tb)                         // дальность врага в долях кадра
+                    val rMe = Layout.SHOOT * 0.9                          // наша рабочая дальность
+                    val dashH = tb.dash.toDouble() * Layout.SHOOT / Brawlers.COLT_RANGE_TILES
+                    band = when {
+                        tb.role == Role.SNIPER || rEn > rMe * 1.05 -> 0.34          // он бьёт дальше нас: на дистанции проиграем, сближаемся
+                        tb.role == Role.THROWER -> 0.34                              // метатель вблизи слаб
+                        rEn < rMe * 0.5 -> (rEn + 0.26 + dashH * 0.5).coerceIn(0.42, 0.66)   // ближник: держим вне досягаемости + запас на рывок
+                        else -> band + 0.05 * (tb.burst - 0.6)
+                    }
+                    strafeK = if (tb.role == Role.SNIPER || rEn > rMe) 1.5 else if (rEn < rMe * 0.5) 0.7 else 1.0
                 }
                 // стена между нами - идём обходом; иначе дистанцию держит сама оценка направлений
                 if (tgt != null && engage && !reload && dist > band + 0.08) goalToward(tgt.rx, tgt.ry, now, ne > 1)
@@ -854,7 +896,7 @@ class Brain(private val w: Int, private val h: Int) {
                 // стрейф только короткими перебежками (иначе бот "наворачивает круги" и сам себе мажет прицел)
                 val hold = tgt != null && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
                         los(tgt.rx, tgt.ry) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
-                pickMove(gdx, gdy, wg, band, 3.0, (if (hold) 0.15 else 0.6) * prm.strafeMul, if (reload || !engage) 1.8 else 0.2)
+                pickMove(gdx, gdy, wg, band, 3.0, (if (hold) 0.15 else 0.6) * prm.strafeMul * strafeK, if (reload || !engage) 1.8 else 0.2)
                 // «постоять и прицелиться» - окнами по ~0.4 с, а не случайным дёрганием джойстика каждый кадр
                 if (hold) {
                     if (now < holdUntil) moving = false
@@ -950,6 +992,9 @@ class Brain(private val w: Int, private val h: Int) {
                 o.why = "ящик (тап)"
             }
         }
+        val tbi2 = tgt?.bi
+        if (tbi2 != null && tgt != null) o.tinfo = tbi2.key + " (" + Role.NAMES[tbi2.role] + ", бьёт на " + tbi2.rng + " кл., хп ~" + (tbi2.hp * tgt.hp).toInt() + ")"
+        else if (tgt != null) o.tinfo = "бравлер не опознан"
         if (o.attack) { lastAttackAt = now; shots++ }
         if (!o.attack && o.why.isEmpty()) o.why = if (ne == 0) "нет цели" else "далеко"
         return o

@@ -187,10 +187,12 @@ class CaptureService : Service() {
                             od.heur = ArrayList<Det>(brain.hDets)
                             od.meX = a.meX; od.meY = a.meY
                             od.mx = a.mx; od.my = a.my; od.ax = a.ax; od.ay = a.ay; od.attack = a.attack
-                            od.hud = a.state + " | " + a.why + "  хп " + (if (a.hp >= 0f) "" + (a.hp * 100).toInt() + "%" else "?") +
-                                "  патр " + (if (a.ammo >= 0f) "%.1f".format(a.ammo * 3) else "?") + "  врагов " + a.enemies + "\n" +
-                                (if (yoloInfo.isNotEmpty()) yoloInfo else "YOLO выключена: только цветовые эвристики") + "\n" +
-                                "жесты " + BotService.sent + "/" + BotService.done + "  отмен " + BotService.cancelled
+                            val ycs = yoloRunner
+                            val ytxt = if (ycs == null) "YOLO выкл" else if (ycs.failed) "YOLO сбой" else if (ycs.runs == 0) "YOLO грузится" else "YOLO " + ycs.accel + " %.0f мс".format(ycs.ms)
+                            od.hud = a.state + " | " + a.why + "\n" + (if (a.tinfo.isNotEmpty()) "цель: " + a.tinfo + "\n" else "") +
+                                "хп " + (if (a.hp >= 0f) "" + (a.hp * 100).toInt() + "%" else "?") +
+                                "  патр " + (if (a.ammo >= 0f) "%.1f".format(a.ammo * 3) else "?") + "  врагов " + a.enemies +
+                                "  | " + ytxt + "  | жесты " + BotService.sent + "/" + BotService.done
                             BotService.inst?.overlayUpdate(od)
                         }
                         if (record && tick % 4 == 0) {
@@ -198,7 +200,7 @@ class CaptureService : Service() {
                             // ширина буфера бывает больше кадра (выравнивание строк): режем до реальной ширины, иначе разметка поедет
                             val copy = if (bw == cw) bmp!!.copy(Bitmap.Config.ARGB_8888, false) else Bitmap.createBitmap(bmp!!, 0, 0, cw, ch)
                             val name = "f$tick.jpg"; val lname = "f$tick.txt"; val lbl = brain.labelText()
-                            val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo},"why":"${a.why}"}""" + "\n"
+                            val line = """{"t":$now,"f":"$name","st":"${a.state}","mx":${a.mx},"my":${a.my},"ax":${a.ax},"ay":${a.ay},"atk":${a.attack},"tap":${a.attackTap},"sup":${a.sup},"gad":${a.gadget},"en":${a.enemies},"hp":${a.hp},"ammo":${a.ammo},"why":"${a.why}","tgt":"${a.tinfo}"}""" + "\n"
                             io?.execute { // запись на диск в отдельном потоке
                                 try {
                                     saveFrame(name, copy)
