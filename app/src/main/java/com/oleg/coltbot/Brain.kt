@@ -302,10 +302,24 @@ class Brain(private val w: Int, private val h: Int) {
         val tgt = tg
         var perpX = 0.0; var perpY = 0.0
         if (tgt != null) { val d = hypot(tgt.rx, tgt.ry).coerceAtLeast(1.0); perpX = -tgt.ry / d; perpY = tgt.rx / d }
+        // отталкивание от стен: рейкаст идёт из центра тонким лучом, а у персонажа есть ширина - на углах он цеплялся.
+        // стена рядом мягко выталкивает в сторону, поэтому вдоль стены он скользит, а не упирается
+        var repX = 0.0; var repY = 0.0
+        for (by in max(0, meBy - 4)..min(bhc - 1, meBy + 4)) for (bx in max(0, meBx - 4)..min(bwc - 1, meBx + 4)) {
+            if (!obst[by * bwc + bx]) continue
+            val ox = bx * B + B / 2.0 - meXf; val oy = by * B + B / 2.0 - meYf
+            val dd = hypot(ox, oy)
+            if (dd < B * 2.2 || dd > B * 4.2) continue        // ближе 2.2 блока - скорее всего сам персонаж
+            val wgt = (B * 4.2 - dd) / (B * 2.0)
+            repX -= ox / dd * wgt; repY -= oy / dd * wgt
+        }
+        val rl = hypot(repX, repY)
+        if (rl > 1.0) { repX /= rl; repY /= rl }
         var best = -1e18; var bk = 0
         for (k in 0 until 16) {
             val dx = dirX[k]; val dy = dirY[k]
             var s = 0.0
+            s += 1.6 * (dx * repX + dy * repY)
             // стены впереди
             val free = freeRun(dx, dy, 6)
             if (free < 3) s -= (3 - free) * 1.3
@@ -361,15 +375,19 @@ class Brain(private val w: Int, private val h: Int) {
                 tt = if (lo > 0.0) lo else if (hi > 0.0) hi else tt
             }
         }
-        tt = tt.coerceIn(0.0, 1.0)
+        tt = tt.coerceIn(0.0, 0.5)     // дальше полусекунды предсказывать бессмысленно: враг сменит направление
         // доверие к упреждению: мало наблюдений / враг мечется -> стреляем ближе к текущей позиции
         val conf = if (t.hits >= 4) 0.45 + 0.55 * t.cons else 0.35
         var lx = t.vx * tt * conf; var ly = t.vy * tt * conf
         val ll = hypot(lx, ly); val cap = h * 0.35
         if (ll > cap) { lx *= cap / ll; ly *= cap / ll }
         val tx = r0x + lx; val ty = r0y + ly
-        val l = hypot(tx, ty).coerceAtLeast(1.0)
-        o.ax = (tx / l).toFloat(); o.ay = (ty / l).toFloat()
+        // точка упреждения оказалась в стене или за ней (враг заворачивает за угол) - бьём без упреждения
+        val pbx = ((meXf + tx) / B).toInt().coerceIn(0, bwc - 1); val pby = ((meYf + ty) / B).toInt().coerceIn(0, bhc - 1)
+        val useLead = !obst[pby * bwc + pbx] && los(tx, ty)
+        val fx = if (useLead) tx else r0x; val fy = if (useLead) ty else r0y
+        val l = hypot(fx, fy).coerceAtLeast(1.0)
+        o.ax = (fx / l).toFloat(); o.ay = (fy / l).toFloat()
     }
 
     // ================= ВОСПРИЯТИЕ (калибровка под твой экран - без изменений) =================
@@ -761,6 +779,16 @@ class Brain(private val w: Int, private val h: Int) {
         val minHits = if (dets != null) 2 else 3
         for (t in tracks) if (t.last == now && t.hits >= minHits) vis.add(t)
         val ne = vis.size
+        // самая близкая угроза-ближник (ассасин, танк или «дробовик»): ей нельзя дать подойти, а стоять перед ней на месте - смерть
+        var mel: Track? = null; var meld = 1e9
+        for (t in vis) {
+            val bi0 = t.bi ?: continue
+            if (bi0.role == Role.ASSASSIN || bi0.role == Role.TANK || bi0.burst > 0.8f) {
+                val dd0 = hypot(t.rx, t.ry); if (dd0 < meld) { meld = dd0; mel = t }
+            }
+        }
+        val meleeDist = (meld / h).toFloat()
+        val isAssassin = mel != null && meleeDist < 0.55f
         var tgt: Track? = null; var bestPr = -1.0
         for (t in vis) {
             val d = hypot(t.rx, t.ry)
@@ -772,6 +800,7 @@ class Brain(private val w: Int, private val h: Int) {
                 pr *= (0.75 + min(1.0, kill) * 0.5) * (0.9 + 0.2 * tbi.burst)
             }
             if (t.id == tgId) pr *= 1.35        // не прыгаем между целями
+            if (isAssassin && t === mel) pr *= 2.2   // ближник рядом - бьём в первую очередь его
             if (pr > bestPr) { bestPr = pr; tgt = t }
         }
         tg = tgt
@@ -801,7 +830,14 @@ class Brain(private val w: Int, private val h: Int) {
         val o = out
         o.tinfo = ""; o.why = ""; o.attack = false; o.attackTap = false; o.sup = false; o.gadget = false; o.enemies = ne; o.hp = hp; o.ammo = ammo; o.eHp = nHp
         o.meX = if (hp >= 0f || bk >= 0) meX.toFloat() else -1f; o.meY = meY.toFloat()
-        if (now - lastFlip > flipEvery) { strafe = -strafe; lastFlip = now; flipEvery = Random.nextLong(700, 1500) }
+        // враг идёт на нас (его скорость направлена к нам) или нам только что попали - меняем сторону быстро и непредсказуемо
+        val tg0 = tg
+        val closingFast = tg0 != null && (-(tg0.vx * tg0.rx + tg0.vy * tg0.ry) / hypot(tg0.rx, tg0.ry).coerceAtLeast(1.0)) > Layout.PLAYER_SPEED * h * 0.5
+        val justHit = hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f
+        if (now - lastFlip > flipEvery) {
+            strafe = -strafe; lastFlip = now
+            flipEvery = if (closingFast || justHit) Random.nextLong(250, 520) else Random.nextLong(400, 950)
+        }
         if (hp >= 0 && prevHp >= 0 && hp < prevHp - 0.03f && ne > 0) { strafe = -strafe; lastFlip = now }
         if (hp >= 0f && prevHp >= 0f && hp < prevHp - 0.05f) taken += (prevHp - hp)
         prevHp = hp
@@ -815,7 +851,10 @@ class Brain(private val w: Int, private val h: Int) {
             val myvx = if (stuckSince == 0L) lastMx * spd else 0.0; val myvy = if (stuckSince == 0L) lastMy * spd else 0.0
             val closing = -((tgt.vx - myvx) * ux + (tgt.vy - myvy) * uy)   // > 0: дистанция сокращается
             val retreating = lastMx * ux + lastMy * uy < -0.3
-            if (retreating && closing > spd * 0.10 && dist < 0.55f) {
+            if (isAssassin) {
+                // против ассасина/танка остановка = смерть на месте: пятимся и стреляем (выстрел от движения не зависит), ждём супер
+                standUntil = 0L; retreatSince = 0L
+            } else if (retreating && closing > spd * 0.10 && dist < 0.55f) {
                 if (retreatSince == 0L) retreatSince = now else if (now - retreatSince > 700) { standUntil = now + prm.standMs.toLong(); retreatSince = 0L }
             } else retreatSince = 0L
         }
@@ -867,7 +906,7 @@ class Brain(private val w: Int, private val h: Int) {
             "POISON" -> { cdx = 0.7 * cdx + 0.3 * pvux; cdy = 0.7 * cdy + 0.3 * pvuy
                 pickMove(pvux, pvuy, 3.0, 0.0, 0.0, 0.0, 0.5) }
             "PINCH" -> pickMove(pnx * strafe, pny * strafe, 2.5, 0.0, 0.0, 0.0, 1.0)
-            "EVADE" -> pickMove(-ux, -uy, 0.6, 0.85, 3.0, 0.4, 1.5)
+            "EVADE" -> pickMove(-ux, -uy, 0.6, 0.85, 3.0, 1.2, 1.5)
             "HIDE" -> {
                 if (inBush) moving = false
                 else { goalToward(bushX, bushY, now, avoid); pickMove(gdx, gdy, 2.5, 0.5, if (ne > 0) 1.0 else 0.0, 0.0, 0.0) }
@@ -903,10 +942,13 @@ class Brain(private val w: Int, private val h: Int) {
                 }
                 // стена между нами - идём обходом; иначе дистанцию держит сама оценка направлений
                 if (tgt != null && engage && !reload && dist > band + 0.08) goalToward(tgt.rx, tgt.ry, now, ne > 1)
-                val wg = if (gdx != 0.0 || gdy != 0.0) 1.6 else 0.0
+                var wg = if (gdx != 0.0 || gdy != 0.0) 1.6 else 0.0
+                // ближник уже на нашей дистанции: целью движения становится «прочь от него» (веса band и стрейфа остаются)
+                val mm = mel
+                if (isAssassin && mm != null && meleeDist < band + 0.05) { gdx = -mm.rx / meld; gdy = -mm.ry / meld; wg = 2.2 }
                 // если дистанция в порядке, враг виден и есть патроны - стоим и стреляем,
                 // стрейф только короткими перебежками (иначе бот "наворачивает круги" и сам себе мажет прицел)
-                val hold = tgt != null && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
+                val hold = tgt != null && !isAssassin && dist > Layout.TOO_CLOSE - 0.05f && dist < band + 0.07f &&
                         los(tgt.rx, tgt.ry) && (ammo < 0f || ammo >= Layout.FIRE_MIN_AMMO)
                 pickMove(gdx, gdy, wg, band, 3.0, (if (hold) 0.15 else 0.6) * prm.strafeMul * strafeK, if (reload || !engage) 1.8 else 0.2)
                 // «постоять и прицелиться» - окнами по ~0.4 с, а не случайным дёрганием джойстика каждый кадр
@@ -975,8 +1017,9 @@ class Brain(private val w: Int, private val h: Int) {
                 val behindWall = !sight && dist < 0.55f
                 // жмём ульту щедро: двое на линии, добивание, пробитие стены, дуэль на средней дистанции
                 // или почти смертельная опасность (ульт Кольта ломает стены и отпугивает)
+                val panicMelee = isAssassin && sight && meleeDist < 0.38f      // ближник вплотную - ульта в лицо
                 if (now - lastSuper > 2500 &&
-                    (value >= 2 || (value >= 1 && (tgt.hp <= 0.60 || behindWall || (sight && dist < 0.6f && ne == 1))) ||
+                    (panicMelee || value >= 2 || (value >= 1 && (tgt.hp <= 0.60 || behindWall || (sight && dist < 0.6f && ne == 1))) ||
                      (low && sight && dist < 0.45f) || (now < standUntil && sight && dist < 0.55f))) {
                     o.sup = true; lastSuper = now
                 }
