@@ -27,7 +27,7 @@ class OverlayView(ctx: Context) : View(ctx) {
     private val dot = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 1.5f * dn }
     private val line = Paint().apply { style = Paint.Style.STROKE; strokeWidth = 2.5f * dn; isAntiAlias = false }
     private val txt = Paint().apply { textSize = 11f * dn; isAntiAlias = true; setShadowLayer(2f * dn, 0f, 0f, Color.BLACK) }
-    private val hud = Paint().apply { color = Color.WHITE; textSize = 12f * dn; isAntiAlias = true; setShadowLayer(3f * dn, 0f, 0f, Color.BLACK) }
+    private val hud = Paint().apply { color = Color.WHITE; textSize = 11f * dn; isAntiAlias = true; setShadowLayer(3f * dn, 0f, 0f, Color.BLACK) }
 
     private fun colorOf(role: Int): Int = when (role) {
         Cls.ENEMY -> Color.rgb(255, 0, 255)      // пурпурный
@@ -41,6 +41,10 @@ class OverlayView(ctx: Context) : View(ctx) {
     override fun onDraw(c: Canvas) {
         val d = data ?: return
         val kx = width.toFloat() / d.capW; val ky = height.toFloat() / d.capH
+        // оверлей попадает в тот же захват экрана, который читает бот: зону над персонажем (имя, полоска хп, патроны) не трогаем,
+        // иначе линия поверх полоски ломает чтение хп
+        c.save()
+        if (d.meX >= 0f) c.clipOutRect((d.meX - 36f) * kx, (d.meY - 64f) * ky, (d.meX + 36f) * kx, (d.meY - 6f) * ky)
         // старые эвристики: кружки
         for (e in d.heur) {
             dot.color = colorOf(e.cls)
@@ -66,8 +70,9 @@ class OverlayView(ctx: Context) : View(ctx) {
             if (d.mx != 0f || d.my != 0f) { line.color = Color.rgb(255, 255, 255); c.drawLine(x, y, x + d.mx * 70f * dn, y + d.my * 70f * dn, line) }
             if (d.attack) { line.color = Color.rgb(0, 160, 255); c.drawLine(x, y, x + d.ax * 220f * dn, y + d.ay * 220f * dn, line) }
         }
+        c.restore()
         // строка состояния - в верхней полоске экрана (бот эту область не анализирует)
-        var yy = 16f * dn
-        for (ln in d.hud.split("\n")) { c.drawText(ln, 12f * dn, yy, hud); yy += 15f * dn }
+        var yy = 14f * dn
+        for (ln in d.hud.split("\n")) { c.drawText(ln, 12f * dn, yy, hud); yy += 13f * dn }
     }
 }

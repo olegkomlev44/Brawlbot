@@ -108,6 +108,7 @@ class Brain(private val w: Int, private val h: Int) {
     private val heapCap = 8 * bwc * bhc + 16
     private val heapKey = FloatArray(heapCap); private val heapVal = IntArray(heapCap); private var hn = 0
     private var meXf = 0.0; private var meYf = 0.0; private var meBx = 0; private var meBy = 0
+    private var hpZeroSince = 0L; private var healSince = 0L; private var healCool = 0L
     private var healing = false; private var evadeUntil = 0L; private var hpMark = -1f; private var hpMarkT = 0L
     private var pathOk = false; private var pdx = 0.0; private var pdy = 0.0; private var lastPath = 0L
     private var gdx = 0.0; private var gdy = 0.0
@@ -128,7 +129,7 @@ class Brain(private val w: Int, private val h: Int) {
         gadgetCharges = Layout.GADGET_CHARGES; matchStart = now; retreatSince = 0L; standUntil = 0L
         dealt = 0.0; taken = 0.0; kills = 0; shots = 0; lastAttackAt = 0L; matchFinished = false
         wx = 0.0; wy = 0.0; lastSuper = 0L; lastGadget = 0L; evadeUntil = 0L
-        hpMark = -1f; healing = false; escapeUntil = 0L; stuckSince = 0L; prevHp = -1f
+        hpMark = -1f; healing = false; escapeUntil = 0L; stuckSince = 0L; prevHp = -1f; hpZeroSince = 0L; healSince = 0L; healCool = 0L
         boxSince = 0L; boxIgnoreUntil = 0L
         java.util.Arrays.fill(gVisit, 0); java.util.Arrays.fill(gBad, false)
         exHas = false; safeX = 0.0; safeY = 0.0; safeT = 0L
@@ -383,6 +384,8 @@ class Brain(private val w: Int, private val h: Int) {
             x0[nc] = x.toDouble(); x1[nc] = x.toDouble(); y0[nc] = y.toDouble(); y1[nc] = y.toDouble(); nc++ }
     }
 
+    // цвет заливки полоски хп: градиент от лаймового до травяного, поэтому условие мягче, чем у isOwnGreen
+    private fun barGreen(c: Int): Boolean { val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255; return g > 150 && g - r > 25 && g - b > 60 }
     private fun isOwnGreen(c: Int): Boolean { val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255; return r < 150 && g > 195 && b < 130 }
 
     private fun ammoCols(px: IntArray, stride: Int, xs: Int, y: Int): Int {
@@ -604,9 +607,16 @@ class Brain(private val w: Int, private val h: Int) {
         }
         if (bk >= 0) {
             val xs = candX[bk]; val yb = candY[bk]
-            var best = 0
-            for (yy in yb + 1..min(h - 1, yb + 4)) best = max(best, runLen(px, stride, xs, yy))
-            hp = (best / (Layout.BAR_FULL * w)).toFloat().coerceIn(0f, 1f)
+            val barW = Layout.BAR_FULL * w
+            val xEnd = min(w - 1, xs + (barW * 1.04).toInt())
+            var right = -1
+            for (yy in yb..min(h - 1, yb + 6)) {
+                var xx = xEnd
+                while (xx > xs + 2 && xx > right) { if (barGreen(px[yy * stride + xx])) { right = xx; break }; xx-- }
+            }
+            hp = if (right < 0) 0f else ((right - xs + 1) / barW).toFloat().coerceIn(0f, 1f)
+            // 0% дольше 1.5 с при живой шкале патронов - это сбой чтения полоски, а не реальные 0%: считаем, что хп в порядке
+            if (hp < 0.03f) { if (hpZeroSince == 0L) hpZeroSince = now; if (now - hpZeroSince > 1500) hp = 0.7f } else hpZeroSince = 0L
             ammo = (bCols / (0.0397f * w)).coerceIn(0f, 1f)   // пустая шкала = 0 патронов (а не "неизвестно")
             meX = xs + Layout.BAR_FULL * w / 2.0; meY = yb + h * 0.083
             pBarX = meX; pBarY = yb.toDouble()
@@ -625,7 +635,9 @@ class Brain(private val w: Int, private val h: Int) {
             if (lastPlayerSeen == 0L || now - lastPlayerSeen > Layout.MATCH_GAP_MS) { if (!matchFinished && matchStart > 0L) finishMatch(now); matchReset(now) }
             lastPlayerSeen = now
             markSeen(now)
-            if (hp < 0.6f) healing = true else if (hp > 0.9f) healing = false
+            if (hp < 0.6f && now >= healCool) healing = true else if (hp > 0.9f) healing = false
+            if (healing) { if (healSince == 0L) healSince = now } else healSince = 0L
+            if (healing && now - healSince > 9000) { healing = false; healCool = now + 20000 }   // не сидим в кусте вечно, если хп не растёт
             if (now - hpMarkT > 1500) { if (hpMark >= 0f && hpMark - hp > 0.25f) evadeUntil = now + 2000; hpMark = hp; hpMarkT = now }
         }
         // ---- яд, кубки, кусты, карта ----
